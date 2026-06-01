@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PolymarketFarm</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- ── STATUS BAR ── -->
+  <header class="topbar">
+    <div class="brand">PolymarketFarm</div>
+    <div class="stat-group">
+      <div class="stat">
+        <span class="label">Баланс</span>
+        <span id="balance" class="value">—</span>
+      </div>
+      <div class="stat">
+        <span class="label">Позиций</span>
+        <span id="active-count" class="value">—</span>
+      </div>
+      <div class="stat">
+        <span class="label">Заработано</span>
+        <span id="earned" class="value">—</span>
+      </div>
+    </div>
+    <div class="bot-ctrl">
+      <span id="bot-status" class="badge badge-off">СТОП</span>
+      <button id="btn-toggle" class="btn btn-primary" onclick="toggleBot()">Запустить</button>
+      <button class="btn btn-ghost" onclick="manualTick()" title="Один цикл вручную">▶ Тик</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- ── SETTINGS ── -->
+    <section class="card settings-card">
+      <h2>Настройки</h2>
+      <div class="settings-grid">
+        <label>
+          Глубина ордера
+          <select id="s-depth">
+            <option value="edge">Край диапазона (безопасно)</option>
+            <option value="mid">Середина диапазона</option>
+            <option value="first">1-я позиция (макс. награда)</option>
+          </select>
+        </label>
+        <label title="% капитала на одну позицию. 10% → 10 позиций, 25% → 4 позиции, 5% → 20 позиций">
+          % на позицию
+          <input id="s-slot-pct" type="number" min="1" max="100" step="1" value="10" />
+        </label>
+        <label title="Сколько слотов может получить один рынок если он супер-выгодный">
+          Макс. слотов на рынок
+          <input id="s-max-slots-per-market" type="number" min="1" max="4" step="1" value="2" />
+        </label>
+        <label>
+          Мин. дневная награда, $
+          <input id="s-min-reward" type="number" min="0.1" step="0.1" value="1.0" />
+        </label>
+        <label>
+          Интервал сканирования, сек
+          <input id="s-interval" type="number" min="10" step="10" value="60" />
+        </label>
+        <label>
+          Порог волатильности
+          <input id="s-volatility" type="number" min="0.001" max="1" step="0.005" value="0.03" />
+        </label>
+        <label title="Мин. спред наград (±¢ от midpoint). Рынки с меньшим спредом отсеиваются">
+          Мин. спред, ¢
+          <input id="s-min-spread" type="number" min="0.1" max="20" step="0.5" value="4" />
+        </label>
+        <label title="Макс. реальный спред стакана (best ask − best bid). Рынки с более широким спредом — неликвидны">
+          Макс. спред стакана, ¢
+          <input id="s-max-ob-spread" type="number" min="0.5" max="20" step="0.5" value="2" />
+        </label>
+        <label title="Макс. изменений цены в день. Рынки активнее этого порога — не мёртвые, пропускаются">
+          Макс. сделок в день
+          <input id="s-max-daily-trades" type="number" min="0" max="50" step="1" value="3" />
+        </label>
+        <label title="Частота проверки позиций в секундах. 5 = агрессивно, 30 = экономно по API">
+          Проверка позиций, сек
+          <input id="s-monitor-interval" type="number" min="5" max="120" step="5" value="5" />
+        </label>
+        <label title="Фиксированный размер ордера в USDC. 0 = авто (% на позицию × капитал)">
+          Макс. $ на ордер (0 = авто)
+          <input id="s-max-order-usdc" type="number" min="0" step="1" value="0" />
+        </label>
+        <label title="Лимит открытых позиций. 0 = авто (100 / % на позицию)">
+          Макс. позиций (0 = авто)
+          <input id="s-max-positions" type="number" min="0" max="200" step="1" value="0" />
+        </label>
+      </div>
+      <label class="word-bl-label" title="Слова через запятую. Рынки с этими словами — пропускаются и закрываются">
+        Фильтр слов (через запятую)
+        <textarea id="s-word-blacklist" placeholder="russia, iran, trump, elon, ..."></textarea>
+      </label>
+      <div class="settings-footer" style="margin-top:16px">
+        <button class="btn btn-primary" onclick="saveSettings()">Сохранить</button>
+        <span id="settings-msg" class="msg"></span>
+      </div>
+    </section>
+
+    <!-- ── STATS ── -->
+    <section class="card stats-card">
+      <h2>Статистика</h2>
+      <div class="stats-grid">
+        <div class="stat-box">
+          <div class="stat-label">Баланс сейчас</div>
+          <div class="stat-val" id="st-balance">—</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Изменение за 24ч</div>
+          <div class="stat-val" id="st-delta-24h">—</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Расч. доход/день</div>
+          <div class="stat-val" id="st-est-daily">—</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Вложено сейчас</div>
+          <div class="stat-val" id="st-invested">—</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Всего ордеров</div>
+          <div class="stat-val" id="st-total">—</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Исполнено / Отменено</div>
+          <div class="stat-val" id="st-filled-cancelled">—</div>
+        </div>
+      </div>
+      <div class="balance-chart-wrap">
+        <canvas id="balance-chart" height="60"></canvas>
+      </div>
+    </section>
+
+    <!-- ── MARKETS ── -->
+    <section class="card">
+      <div class="card-header">
+        <h2>Рынки-кандидаты <span id="markets-count" class="count-badge">0</span></h2>
+        <button class="btn btn-ghost" onclick="refreshMarkets()">Обновить</button>
+      </div>
+      <div class="table-wrap">
+        <table id="markets-table">
+          <thead>
+            <tr>
+              <th title="Дневная награда / ликвидность в топ-4 зоне × 100 — сколько центов приносит каждый вложенный $1 в день">¢/$1/день</th>
+              <th>Рынок</th>
+              <th title="Дневная награда в USDC">$/день</th>
+              <th title="Цена YES-токена в центах — вероятность события. Чем ниже, тем дешевле позиция">YES ¢</th>
+              <th title="Минимальный вход в USDC (min_size × цена токена). Должно быть меньше твоего бюджета на рынок">Мин. $</th>
+              <th title="Суммарная ликвидность USDC в топ-4 позициях (меньше = меньше конкурентов)">Зона $</th>
+              <th title="Смен цены за 30д — 0 = мёртвый рынок">Сделки</th>
+              <th>Окончание</th>
+              <th>Действие</th>
+            </tr>
+          </thead>
+          <tbody id="markets-body">
+            <tr><td colspan="9" class="empty">Нет данных — нажмите «Обновить»</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ── POSITIONS ── -->
+    <section class="card">
+      <div class="card-header">
+        <h2>Активные позиции <span id="pos-count" class="count-badge">0</span></h2>
+        <button class="btn btn-danger-ghost" onclick="cancelAll()">Отменить все</button>
+      </div>
+      <div class="table-wrap">
+        <table id="positions-table">
+          <thead>
+            <tr>
+              <th>Рынок</th>
+              <th>Сторона</th>
+              <th>Цена</th>
+              <th>Размер</th>
+              <th>Статус</th>
+              <th>Размещён</th>
+              <th>Действие</th>
+            </tr>
+          </thead>
+          <tbody id="positions-body">
+            <tr><td colspan="7" class="empty">Нет открытых позиций</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ── ERRORS ── -->
+    <section id="errors-section" class="card errors-card" style="display:none">
+      <h2>Ошибки</h2>
+      <ul id="errors-list"></ul>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,36 @@
+# Environment & secrets
+.env
+
+# Database
+*.db
+*.db-journal
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Test & utility scripts
+test_*.py
+calc_invested.py
+cancel_extreme.py
+check_*.py
+
+# Backups
+*_backup.py
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
