@@ -1,71 +1,172 @@
 # PolymarketBot
 
-Automated liquidity provider rewards farming bot for [Polymarket](https://polymarket.com).
+Бот для автоматического фарминга LP-наград на [Polymarket](https://polymarket.com).
 
-## What it does
+Бот размещает лимитные ордера в reward zone предсказательных рынков и пассивно зарабатывает вознаграждения за предоставление ликвидности. Ищет "мёртвые" рынки с минимальной конкуренцией и максимальным reward/liquidity ratio.
 
-Places limit orders on Polymarket prediction markets to earn LP rewards. Targets "dead" markets with low activity and high reward-per-dollar ratio.
+---
 
-## Features
+## Как это работает
 
-- Rotating market scanner — processes all reward markets in batches
-- Smart scoring — `reward_per_dollar × activity_factor`
-- Auto-repositioning — keeps orders inside the reward zone
-- Word blacklist — filter markets by keyword
-- Fixed or % based order sizing
-- Web UI dashboard at `localhost:8000`
+- Сканирует все рынки с активными наградами на Polymarket
+- Оценивает каждый рынок по формуле: `score = (daily_reward / zone_liquidity) × activity_factor`
+- Размещает BUY ордера внутри reward zone
+- Каждые 5 секунд проверяет позиции: репозиционирует при дрейфе цены, закрывает при ухудшении рынка
+- Автоматически переключается на более выгодные рынки
 
-## Requirements
+---
 
-- Python 3.11+
-- Polymarket account with API credentials
+## Требования
 
-## Setup
+- **Python 3.11+**
+- **Аккаунт Polymarket** с пополненным балансом в USDC (сеть Polygon)
+- **API ключи Polymarket** (получить на polymarket.com в настройках профиля)
+- Windows / Linux / Mac
 
+---
+
+## Установка с нуля
+
+### 1. Установи Python 3.11+
+
+Скачай с [python.org](https://www.python.org/downloads/) и установи.  
+При установке на Windows поставь галочку **"Add Python to PATH"**.
+
+Проверь:
 ```bash
-# 1. Clone
-git clone https://github.com/ggRonin/PolymarketBot.git
-cd PolymarketBot
-
-# 2. Create virtual environment
-python -m venv .venv
-.venv\Scripts\activate  # Windows
-source .venv/bin/activate  # Linux/Mac
-
-# 3. Install dependencies
-pip install -e .
-
-# 4. Configure
-cp .env.example .env
-# Edit .env with your credentials
-
-# 5. Run
-start.bat  # Windows
-# or: python -m uvicorn src.main:app --port 8000
+python --version
+# Python 3.11.x
 ```
 
-## Configuration
+### 2. Скачай бот
 
-Copy `.env.example` to `.env` and fill in:
+```bash
+git clone https://github.com/ggRonin/PolymarketBot.git
+cd PolymarketBot
+```
 
-| Variable | Description |
-|----------|-------------|
-| `WALLET_ADDRESS` | Your Polymarket wallet address |
-| `PRIVATE_KEY` | Wallet private key |
-| `API_KEY` | Polymarket API key |
+Или скачай ZIP через кнопку **Code → Download ZIP** на этой странице и распакуй.
 
-All bot settings are configurable via the web UI at `http://localhost:8000`.
+### 3. Создай виртуальное окружение
 
-## How rewards work
+```bash
+python -m venv .venv
+```
 
-Polymarket pays LP rewards based on **number of shares** in the reward zone, not USDC value. Formula:
+Активируй:
+- **Windows:** `.venv\Scripts\activate`
+- **Linux/Mac:** `source .venv/bin/activate`
 
+### 4. Установи зависимости
+
+```bash
+pip install -e .
+```
+
+### 5. Получи API ключи Polymarket
+
+1. Зайди на [polymarket.com](https://polymarket.com) и войди в аккаунт
+2. Перейди в **Profile → Settings → API Keys**
+3. Создай новый ключ — скопируй `API Key`, `Private Key` и адрес кошелька
+
+### 6. Настрой .env файл
+
+Скопируй шаблон:
+```bash
+cp .env.example .env
+```
+
+Открой `.env` и заполни:
+```env
+WALLET_ADDRESS=0xТвойАдресКошелька
+PRIVATE_KEY=0xТвойПриватныйКлюч
+API_KEY=твой-api-ключ
+```
+
+> ⚠️ **Никогда не публикуй `.env` файл** — в нём приватный ключ от кошелька.
+
+### 7. Запусти бот
+
+**Windows:**
+```
+Дважды кликни start.bat
+```
+
+**Linux/Mac:**
+```bash
+python -m uvicorn src.main:app --port 8000
+```
+
+Открой браузер: **http://localhost:8000**
+
+---
+
+## Настройки
+
+Все параметры меняются через веб-интерфейс без перезапуска бота.
+
+| Параметр | Описание | По умолчанию |
+|----------|----------|-------------|
+| **Глубина ордера** | Куда ставить внутри reward zone: край / середина / первая позиция | Середина |
+| **% на позицию** | Процент от капитала на одну позицию | 5% |
+| **Макс. слотов на рынок** | Максимум позиций на один рынок (для супер-выгодных) | 2 |
+| **Мин. дневная награда, $** | Минимальная дневная награда рынка для входа | 7.0 |
+| **Интервал сканирования, сек** | Как часто искать новые рынки | 60 |
+| **Порог волатильности** | Макс. std цены за 24ч (0.03 = 3%) | 0.03 |
+| **Мин. спред, ¢** | Мин. ширина reward zone в центах | 3 |
+| **Макс. спред стакана, ¢** | Макс. bid-ask спред — фильтр ликвидности | 2.0 |
+| **Макс. сделок в день** | Макс. изменений цены за день | 2 |
+| **Макс. $ на ордер** | Фиксированный размер ордера в USDC (0 = авто) | 0 |
+| **Макс. позиций** | Лимит открытых позиций (0 = авто) | 0 |
+| **Фильтр слов** | Слова через запятую — рынки с ними пропускаются | — |
+
+---
+
+## Стратегия
+
+Бот ищет **"мёртвые" рынки** — где цена почти не двигается. В таких рынках:
+- Ордер долго висит в reward zone и накапливает награды
+- Низкая конкуренция → большая доля наград достаётся нам
+- Минимальный риск исполнения ордера
+
+Награды Polymarket считаются по **количеству шейрсов**, а не по вложенным долларам:
 ```
 Score = ((max_spread - order_spread) / max_spread)² × order_size_in_shares
 ```
 
-The bot targets markets with the highest `reward / zone_liquidity` ratio.
+---
+
+## Структура проекта
+
+```
+PolymarketBot/
+├── src/
+│   ├── bot.py        # Основной цикл фарминга
+│   ├── scanner.py    # Поиск и скоринг рынков
+│   ├── pm_client.py  # Обёртка над Polymarket API
+│   ├── db.py         # SQLite хранилище позиций
+│   ├── config.py     # Настройки из .env
+│   └── main.py       # FastAPI сервер + веб UI
+├── static/
+│   ├── index.html    # Веб-интерфейс
+│   ├── app.js        # Frontend логика
+│   └── style.css     # Стили
+├── .env.example      # Шаблон конфига
+├── pyproject.toml    # Зависимости
+└── start.bat         # Запуск на Windows
+```
+
+---
+
+## Важно
+
+- Бот работает с **реальными деньгами** — начни с небольшой суммы
+- Установи **"Макс. $ на ордер"** чтобы контролировать риск
+- Используй **фильтр слов** чтобы исключить нежелательные категории рынков (politics, russia и т.д.)
+- При остановке бота открытые ордера остаются на Polymarket — закрой их вручную или через кнопку "Отменить все"
+
+---
 
 ## Disclaimer
 
-Use at your own risk. This bot interacts with real funds on Polymarket.
+Используй на свой страх и риск. Бот не гарантирует прибыль.
