@@ -497,10 +497,11 @@ def _ob_spread_cents(order_book) -> float | None:
 
 def bid_depth_spread_cents(bids: list[float]) -> float | None:
     """Spread between 1st and 4th unique price levels in bids (cents).
-    Large gap means thin liquidity — top orders could disappear and leave us stranded."""
+    Large gap means thin liquidity — top orders could disappear and leave us stranded.
+    Less than 4 levels = too thin, returns 999 to always fail the filter."""
     levels = sorted(set(round(b, 2) for b in bids), reverse=True)
     if len(levels) < 4:
-        return None
+        return 999.0
     return round((levels[0] - levels[3]) * 100, 1)
 
 
