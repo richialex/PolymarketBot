@@ -95,6 +95,7 @@ async def enrich_batch(
     max_markets: int = 200,
     max_ob_spread: float = 2.0,
     max_daily_trades: int = 3,
+    max_bid_depth_spread: float = 4.0,
 ) -> list[ScoredMarket]:
     """Enrich a pre-selected list of CurrentReward objects → ScoredMarket list."""
     blacklist = {c.lower() for c in (category_blacklist or [])} | BLACKLISTED_CATEGORIES
@@ -174,7 +175,6 @@ async def enrich_batch(
             yes_bids = all_bids_map.get(yes_token_id, [])
 
             # Hard filter: bid-ask spread too wide on the token we will actually BUY.
-            # We buy the expensive token (price > 0.50), so check its spread — not always YES.
             expensive_idx = max(range(len(token_list)), key=lambda i: float(token_list[i]["price"]))
             expensive_ob = all_obs[expensive_idx] if expensive_idx < len(all_obs) else all_obs[0] if all_obs else None
             ob_spread = _ob_spread_cents(expensive_ob)
@@ -182,6 +182,15 @@ async def enrich_batch(
                 log.debug(
                     "Skip %s: bid-ask spread %.1f¢ > max %.1f¢ (on expensive token)",
                     question[:40], ob_spread, max_ob_spread,
+                )
+                continue
+
+            # Hard filter: bid depth too thin — gap between level 1 and level 4 too large
+            depth_spread = bid_depth_spread_cents(yes_bids)
+            if depth_spread is not None and depth_spread > max_bid_depth_spread:
+                log.debug(
+                    "Skip %s: bid depth spread %.1f¢ > max %.1f¢ (levels 1-4)",
+                    question[:40], depth_spread, max_bid_depth_spread,
                 )
                 continue
 
@@ -484,6 +493,15 @@ def _ob_spread_cents(order_book) -> float | None:
     if not bids or not asks:
         return None
     return (asks[0] - bids[0]) * 100
+
+
+def bid_depth_spread_cents(bids: list[float]) -> float | None:
+    """Spread between 1st and 4th unique price levels in bids (cents).
+    Large gap means thin liquidity — top orders could disappear and leave us stranded."""
+    levels = sorted(set(round(b, 2) for b in bids), reverse=True)
+    if len(levels) < 4:
+        return None
+    return round((levels[0] - levels[3]) * 100, 1)
 
 
 def mid_from_order_book(order_book) -> float | None:

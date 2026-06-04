@@ -189,6 +189,7 @@ class BotSettings(BaseModel):
     max_order_usdc: float | None = None
     max_positions: int | None = None
     word_blacklist: list[str] | None = None
+    max_bid_depth_spread: float | None = None
 
 
 @app.get("/api/settings")
@@ -206,9 +207,10 @@ async def get_settings():
         "max_ob_spread":        cfg.max_ob_spread,
         "max_daily_trades":     cfg.max_daily_trades,
         "monitor_interval_s":   cfg.monitor_interval_s,
-        "max_order_usdc":       cfg.max_order_usdc,
-        "max_positions":        cfg.max_positions,
-        "word_blacklist":       cfg.word_blacklist,
+        "max_order_usdc":        cfg.max_order_usdc,
+        "max_positions":         cfg.max_positions,
+        "word_blacklist":        cfg.word_blacklist,
+        "max_bid_depth_spread":  cfg.max_bid_depth_spread,
     }
     return {**defaults, **stored}
 

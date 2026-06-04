@@ -182,7 +182,8 @@ async function loadSettings() {
   if (data.scan_interval_s != null)      document.getElementById('s-interval').value = data.scan_interval_s;
   if (data.volatility_threshold != null) document.getElementById('s-volatility').value = data.volatility_threshold;
   if (data.min_spread != null)           document.getElementById('s-min-spread').value = data.min_spread;
-  if (data.max_ob_spread != null)        document.getElementById('s-max-ob-spread').value = data.max_ob_spread;
+  if (data.max_ob_spread != null)          document.getElementById('s-max-ob-spread').value = data.max_ob_spread;
+  if (data.max_bid_depth_spread != null)   document.getElementById('s-max-bid-depth').value = data.max_bid_depth_spread;
   if (data.max_daily_trades != null)     document.getElementById('s-max-daily-trades').value = data.max_daily_trades;
   if (data.monitor_interval_s != null)   document.getElementById('s-monitor-interval').value = data.monitor_interval_s;
   if (data.max_order_usdc != null)       document.getElementById('s-max-order-usdc').value = data.max_order_usdc;
@@ -201,7 +202,8 @@ async function saveSettings() {
     scan_interval_s:      parseInt(document.getElementById('s-interval').value),
     volatility_threshold: parseFloat(document.getElementById('s-volatility').value),
     min_spread:           parseFloat(document.getElementById('s-min-spread').value),
-    max_ob_spread:        parseFloat(document.getElementById('s-max-ob-spread').value),
+    max_ob_spread:          parseFloat(document.getElementById('s-max-ob-spread').value),
+    max_bid_depth_spread:   parseFloat(document.getElementById('s-max-bid-depth').value),
     max_daily_trades:     parseInt(document.getElementById('s-max-daily-trades').value),
     monitor_interval_s:   parseInt(document.getElementById('s-monitor-interval').value),
     max_order_usdc:       parseFloat(document.getElementById('s-max-order-usdc').value) || 0,

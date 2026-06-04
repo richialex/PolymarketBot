@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     max_ob_spread: float = 2.0     # maximum actual bid-ask spread in cents (order book quality filter)
     max_daily_trades: int = 3      # max price changes per day — markets with more are skipped
     monitor_interval_s: int = 5   # seconds between position checks in monitor loop
+    max_bid_depth_spread: float = 4.0  # max spread between bid levels 1 and 4 (cents)
 
     # User controls
     max_order_usdc: float = 0.0      # 0 = unlimited (slot_pct-based)
