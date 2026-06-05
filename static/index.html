@@ -44,12 +44,16 @@
             <option value="first">1-я позиция (макс. награда)</option>
           </select>
         </label>
-        <label title="% капитала на одну позицию. 10% → 10 позиций, 25% → 4 позиции, 5% → 20 позиций">
-          % на позицию
-          <input id="s-slot-pct" type="number" min="1" max="100" step="1" value="10" />
+        <label title="Фиксированный бюджет одного BUY-входа бота. Бот не откроет позицию, если это больше 90% свободного USDC или больше остатка лимита капитала.">
+          USDC на позицию
+          <input id="s-order-usdc" type="number" min="0.01" step="0.01" value="10" />
         </label>
-        <label title="Сколько слотов может получить один рынок если он супер-выгодный">
-          Макс. слотов на рынок
+        <label title="Сколько капитала бот может задействовать суммарно в своих BUY-позициях. Ручные открытые ордера сюда не входят.">
+          Макс. капитал бота, USDC
+          <input id="s-bot-capital-limit-usdc" type="number" min="0" step="1" value="100" />
+        </label>
+        <label title="Сколько худших рабочих ордеров бот может отменить за один ребаланс, если нашёл рынок заметно лучше.">
+          Макс. отмен при ребалансе
           <input id="s-max-slots-per-market" type="number" min="1" max="4" step="1" value="2" />
         </label>
         <label>
@@ -72,10 +76,6 @@
           Макс. спред стакана, ¢
           <input id="s-max-ob-spread" type="number" min="0.5" max="20" step="0.5" value="2" />
         </label>
-        <label title="Макс. разница между 1-м и 4-м ценовым уровнем в стакане заявок. Защита от тонкого стакана">
-          Макс. глубина стакана, ¢
-          <input id="s-max-bid-depth" type="number" min="1" max="30" step="0.5" value="4" />
-        </label>
         <label title="Макс. изменений цены в день. Рынки активнее этого порога — не мёртвые, пропускаются">
           Макс. сделок в день
           <input id="s-max-daily-trades" type="number" min="0" max="50" step="1" value="3" />
@@ -83,14 +83,6 @@
         <label title="Частота проверки позиций в секундах. 5 = агрессивно, 30 = экономно по API">
           Проверка позиций, сек
           <input id="s-monitor-interval" type="number" min="5" max="120" step="5" value="5" />
-        </label>
-        <label title="Фиксированный размер ордера в USDC. 0 = авто (% на позицию × капитал)">
-          Макс. $ на ордер (0 = авто)
-          <input id="s-max-order-usdc" type="number" min="0" step="1" value="0" />
-        </label>
-        <label title="Лимит открытых позиций. 0 = авто (100 / % на позицию)">
-          Макс. позиций (0 = авто)
-          <input id="s-max-positions" type="number" min="0" max="200" step="1" value="0" />
         </label>
       </div>
       <label class="word-bl-label" title="Слова через запятую. Рынки с этими словами — пропускаются и закрываются">
@@ -143,6 +135,7 @@
         <h2>Рынки-кандидаты <span id="markets-count" class="count-badge">0</span></h2>
         <button class="btn btn-ghost" onclick="refreshMarkets()">Обновить</button>
       </div>
+      <div id="markets-scan-status" class="scan-status">Скан ещё не запускался</div>
       <div class="table-wrap">
         <table id="markets-table">
           <thead>
@@ -169,25 +162,118 @@
     <section class="card">
       <div class="card-header">
         <h2>Активные позиции <span id="pos-count" class="count-badge">0</span></h2>
-        <button class="btn btn-danger-ghost" onclick="cancelAll()">Отменить все</button>
+        <div class="action-group">
+          <button class="btn btn-ghost" onclick="reconcilePositions()">Синхронизировать</button>
+          <button class="btn btn-danger-ghost" onclick="cancelWorking()">Отменить рабочие</button>
+          <button class="btn btn-danger-ghost" onclick="cancelAll()">Отменить все</button>
+        </div>
       </div>
       <div class="table-wrap">
         <table id="positions-table">
           <thead>
             <tr>
               <th>Рынок</th>
+              <th>Outcome</th>
               <th>Сторона</th>
               <th>Цена</th>
               <th>Размер</th>
+              <th>USDC</th>
+              <th>Статус</th>
+              <th>Размещён</th>
+              <th>Действие</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="positions-body">
+            <tr><td colspan="10" class="empty">Нет открытых позиций</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ── UNMANAGED POSITIONS ── -->
+    <section class="card">
+      <div class="card-header">
+        <h2>Несопровождаемые позиции <span id="unmanaged-count" class="count-badge">0</span></h2>
+      </div>
+      <div class="table-wrap">
+        <table id="unmanaged-table">
+          <thead>
+            <tr>
+              <th>Рынок</th>
+              <th>Outcome</th>
+              <th>Средняя</th>
+              <th>Текущая</th>
+              <th>Размер</th>
+              <th>USDC</th>
+              <th>Действие</th>
+            </tr>
+          </thead>
+          <tbody id="unmanaged-body">
+            <tr><td colspan="7" class="empty">Нет несопровождаемых позиций</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ── MANUAL ORDERS ── -->
+    <section class="card">
+      <div class="card-header">
+        <h2>Открытые вручную <span id="manual-count" class="count-badge">0</span></h2>
+      </div>
+      <div class="table-wrap">
+        <table id="manual-orders-table">
+          <thead>
+            <tr>
+              <th>Market ID</th>
+              <th>Outcome</th>
+              <th>Сторона</th>
+              <th>Цена</th>
+              <th>Размер</th>
+              <th>USDC</th>
               <th>Статус</th>
               <th>Размещён</th>
               <th>Действие</th>
             </tr>
           </thead>
-          <tbody id="positions-body">
-            <tr><td colspan="7" class="empty">Нет открытых позиций</td></tr>
+          <tbody id="manual-orders-body">
+            <tr><td colspan="9" class="empty">Нет ручных открытых ордеров</td></tr>
           </tbody>
         </table>
+      </div>
+    </section>
+
+    <!-- ── HISTORY ── -->
+    <section class="card">
+      <div class="card-header">
+        <h2>История <span id="history-count" class="count-badge">0</span></h2>
+        <button id="history-toggle" class="btn btn-ghost btn-caret" title="Показать историю" onclick="toggleHistory()">▼</button>
+      </div>
+      <div id="history-panel" style="display:none">
+        <div class="table-wrap">
+          <table id="history-table">
+            <thead>
+              <tr>
+                <th>Рынок</th>
+                <th>Outcome</th>
+                <th>Сторона</th>
+                <th>Цена</th>
+                <th>Размер</th>
+                <th>USDC</th>
+                <th>Статус</th>
+                <th>Размещён</th>
+              </tr>
+            </thead>
+            <tbody id="history-body">
+              <tr><td colspan="8" class="empty">История пуста</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button class="btn btn-ghost btn-sm" onclick="prevHistoryPage()">Назад</button>
+          <span id="history-page">1 / 1</span>
+          <button class="btn btn-ghost btn-sm" onclick="nextHistoryPage()">Вперёд</button>
+        </div>
       </div>
     </section>
 

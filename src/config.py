@@ -15,9 +15,12 @@ class Settings(BaseSettings):
     http_proxy: str  = Field(default="", alias="HTTP_PROXY")
 
     # Farming defaults (persisted in DB, overridden by UI)
-    slot_pct: float = 25.0         # % of total capital per slot (1 slot = 1 position)
-    max_slots: int = 4             # total slots available across all positions
-    max_slots_per_market: int = 2  # max slots one market can receive (super-deal cap)
+    order_usdc: float = 10.0       # fixed USDC budget for one bot entry
+    bot_capital_limit_usdc: float = 100.0  # max bot-managed BUY exposure
+    free_balance_buffer_pct: float = 10.0  # keep this % of free USDC unused
+    slot_pct: float = 25.0         # legacy: no longer used by the capital model
+    max_slots: int = 4             # legacy: no longer used by the capital model
+    max_slots_per_market: int = 2  # max worst orders cancelled in one rebalance
     scan_interval_s: int = 60
     min_daily_reward: float = 7.0
     depth: str = "edge"            # edge | mid | first
@@ -27,11 +30,10 @@ class Settings(BaseSettings):
     max_ob_spread: float = 2.0     # maximum actual bid-ask spread in cents (order book quality filter)
     max_daily_trades: int = 3      # max price changes per day — markets with more are skipped
     monitor_interval_s: int = 5   # seconds between position checks in monitor loop
-    max_bid_depth_spread: float = 4.0  # max spread between bid levels 1 and 4 (cents)
 
     # User controls
-    max_order_usdc: float = 0.0      # 0 = unlimited (slot_pct-based)
-    max_positions: int = 0           # 0 = auto (100 / slot_pct)
+    max_order_usdc: float = 0.0      # legacy: no longer used by the capital model
+    max_positions: int = 0           # legacy: no longer used by the capital model
     word_blacklist: list[str] = []   # forbidden words in market question
 
 

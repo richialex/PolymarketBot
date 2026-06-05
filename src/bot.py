@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import uuid
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 
@@ -14,7 +15,6 @@ from src.scanner import (
     calc_order_price, calc_sell_order_price,
     mid_from_order_book,
     _extract_bids, _extract_asks, _ob_spread_cents,
-    bid_depth_spread_cents,
     ScoredMarket,
 )
 
@@ -27,16 +27,19 @@ POOL_MAX_SIZE    = 50    # best candidates kept in memory across ticks
 
 
 MONITOR_INTERVAL = 5   # seconds between position checks
+TRADE_INTERVAL = 10    # seconds between trade decisions when scanner runs separately
 
 
 class FarmingBot:
     def __init__(self) -> None:
         self.running = False
-        self._task: asyncio.Task | None = None
+        self._scan_task: asyncio.Task | None = None
+        self._trader_task: asyncio.Task | None = None
         self._monitor_task: asyncio.Task | None = None
         self.last_scan: list[ScoredMarket] = []
         self.errors: list[str] = []
         self._last_depth: str | None = None
+        self._scan_lock = asyncio.Lock()
 
         # Rotating scanner state
         self._rewards_cache: list = []
@@ -44,6 +47,16 @@ class FarmingBot:
         self._rewards_cache_min_daily: float | None = None  # min_daily used when cache was built
         self._scan_cursor: int = 0
         self._candidates_pool: dict[str, ScoredMarket] = {}  # best seen across all ticks
+        self.scan_status: dict = {
+            "rewards_total": 0,
+            "rewards_passing": 0,
+            "batch_size": 0,
+            "batch_scored": 0,
+            "pool_size": 0,
+            "shown": 0,
+            "cursor": 0,
+            "last_updated": None,
+        }
 
     # ── Public API ──────────────────────────────────────────────────────────────
 
@@ -51,35 +64,152 @@ class FarmingBot:
         if self.running:
             return
         self.running = True
-        self._task = asyncio.create_task(self._loop())
+        self._scan_task = asyncio.create_task(self._scanner_loop())
+        self._trader_task = asyncio.create_task(self._trader_loop())
         self._monitor_task = asyncio.create_task(self._monitor_loop())
         log.info("FarmingBot started")
 
     def stop(self) -> None:
         self.running = False
-        for t in (self._task, self._monitor_task):
+        for t in (self._scan_task, self._trader_task, self._monitor_task):
             if t:
                 t.cancel()
-        self._task = None
+        self._scan_task = None
+        self._trader_task = None
         self._monitor_task = None
         log.info("FarmingBot stopped")
 
+    async def reconcile(self) -> dict:
+        """Reconcile local order journal with Polymarket open orders and holdings."""
+        local_positions = await db.get_reconcilable_positions()
+        open_orders = await client.list_open_orders()
+        open_by_id = {str(getattr(o, "id", "") or ""): o for o in open_orders}
+        adopted_pending = 0
+        marked_filled = 0
+        marked_cancelled = 0
+        marked_unknown = 0
+
+        for pos in local_positions:
+            order_id = pos["order_id"]
+            status = str(pos.get("status", "") or "").upper()
+
+            if status == "PENDING_PLACE":
+                match = self._find_matching_open_order(pos, open_orders)
+                if match is not None:
+                    real_id = str(getattr(match, "id", "") or "")
+                    await db.replace_position_order_id(order_id, real_id, status="OPEN")
+                    adopted_pending += 1
+                    continue
+
+                if await self._has_token_position(pos):
+                    await db.update_position_status(
+                        order_id,
+                        "FILLED",
+                        filled_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                    marked_filled += 1
+                else:
+                    await db.update_position_status(order_id, "UNKNOWN")
+                    marked_unknown += 1
+                continue
+
+            if order_id in open_by_id:
+                continue
+
+            order = await client.get_order(order_id)
+            remote_status = str(getattr(order, "status", "") or "").upper() if order else ""
+            if remote_status in ("FILLED", "MATCHED"):
+                await db.update_position_status(
+                    order_id,
+                    "FILLED",
+                    filled_at=datetime.now(timezone.utc).isoformat(),
+                )
+                marked_filled += 1
+            elif remote_status in ("CANCELLED", "CANCELED"):
+                await db.update_position_status(order_id, "CANCELLED")
+                marked_cancelled += 1
+            elif pos.get("side") == "BUY" and await self._has_token_position(pos):
+                await db.update_position_status(
+                    order_id,
+                    "FILLED",
+                    filled_at=datetime.now(timezone.utc).isoformat(),
+                )
+                marked_filled += 1
+            elif status not in ("SELL_PENDING",):
+                await db.update_position_status(order_id, "UNKNOWN")
+                marked_unknown += 1
+
+        await self._recover_missing_sells()
+        return {
+            "checked": len(local_positions),
+            "open_orders": len(open_orders),
+            "adopted_pending": adopted_pending,
+            "marked_filled": marked_filled,
+            "marked_cancelled": marked_cancelled,
+            "marked_unknown": marked_unknown,
+        }
+
+    def _find_matching_open_order(self, pos: dict, open_orders: list) -> object | None:
+        token_id = str(pos.get("token_id", "") or "")
+        side = str(pos.get("side", "") or "").upper()
+        price = float(pos.get("price", 0) or 0)
+        size = float(pos.get("size", 0) or 0)
+        for order in open_orders:
+            try:
+                if str(getattr(order, "token_id", "") or "") != token_id:
+                    continue
+                if str(getattr(order, "side", "") or "").upper() != side:
+                    continue
+                if abs(float(getattr(order, "price", 0) or 0) - price) > 0.0001:
+                    continue
+                original = float(getattr(order, "original_size", 0) or 0)
+                matched = float(getattr(order, "size_matched", 0) or 0)
+                remaining = max(0.0, original - matched)
+                if abs(original - size) <= 0.01 or abs(remaining - size) <= 0.01:
+                    return order
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    async def _has_token_position(self, pos: dict) -> bool:
+        token_id = str(pos.get("token_id", "") or "")
+        expected = float(pos.get("size", 0) or 0)
+        actual = await client.get_token_position_size(token_id)
+        return actual >= max(0.0001, min(expected, 0.0001))
+
     # ── Main loop ───────────────────────────────────────────────────────────────
 
-    async def _loop(self) -> None:
+    async def _scanner_loop(self) -> None:
         while self.running:
             try:
                 cfg = await self._load_cfg()
-                await self.tick(cfg)
+                await self.scan_once(cfg)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 msg = f"{datetime.now(timezone.utc).isoformat()} {e}"
                 self.errors = ([msg] + self.errors)[:50]
-                log.exception("Bot tick error: %s", e)
+                log.exception("Scanner loop error: %s", e)
 
             interval = await db.get_setting("scan_interval_s", 60)
             await asyncio.sleep(int(interval))
+
+    async def _trader_loop(self) -> None:
+        await asyncio.sleep(2)
+        while self.running:
+            try:
+                cfg = await self._load_cfg()
+                await self.trade_once(cfg)
+                monitor_interval = int(cfg.get("monitor_interval_s", MONITOR_INTERVAL))
+                interval = max(MONITOR_INTERVAL, min(TRADE_INTERVAL, monitor_interval))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                msg = f"{datetime.now(timezone.utc).isoformat()} {e}"
+                self.errors = ([msg] + self.errors)[:50]
+                log.exception("Trader loop error: %s", e)
+                interval = MONITOR_INTERVAL
+            await asyncio.sleep(max(MONITOR_INTERVAL, interval))
 
     async def _monitor_loop(self) -> None:
         """Fast loop: check open positions every monitor_interval_s seconds.
@@ -100,96 +230,108 @@ class FarmingBot:
     async def tick(self, cfg: dict | None = None) -> None:
         if cfg is None:
             cfg = await self._load_cfg()
+        await self.scan_once(cfg)
+        await self.trade_once(cfg)
 
-        # 1. Rotating scan — process next batch, merge into persistent pool
-        candidates = await self._rotating_scan(cfg)
-        self.last_scan = candidates
-        log.info("Pool has %d candidates after this tick", len(candidates))
+    async def scan_once(self, cfg: dict | None = None) -> list[ScoredMarket]:
+        if cfg is None:
+            cfg = await self._load_cfg()
 
-        # 2. Exit stale positions (expiring soon, dropped from candidates, or reward dropped)
+        async with self._scan_lock:
+            candidates = await self._rotating_scan(cfg)
+            self.last_scan = candidates
+        log.info("Pool has %d candidates after scan", len(candidates))
+        return candidates
+
+    async def trade_once(self, cfg: dict | None = None) -> None:
+        if cfg is None:
+            cfg = await self._load_cfg()
+
+        candidates = list(self.last_scan)
+        if not candidates:
+            log.info("Trade loop skipped: no scanned candidates yet")
+            return
+
+        # 1. Exit stale positions (expiring soon, dropped from candidates, or reward dropped)
         await self._exit_stale_positions(candidates, cfg)
 
         balance = await client.get_balance()
-        await db.record_balance(float(balance))
+        free_balance = float(balance)
+        await db.record_balance(free_balance)
 
-        # Capital accounting: total = free USDC + locked in open BUY orders
-        locked_usdc = await client.get_locked_usdc()
-        total_capital = float(balance) + locked_usdc
-
-        slot_pct = cfg["slot_pct"]
-        _max_positions = int(cfg.get("max_positions", 0) or 0)
-        max_slots = _max_positions if _max_positions > 0 else max(1, int(100 / slot_pct))
+        order_usdc = max(0.0, float(cfg["order_usdc"] or 0))
+        capital_limit = max(0.0, float(cfg["bot_capital_limit_usdc"] or 0))
+        buffer_pct = min(100.0, max(0.0, float(cfg.get("free_balance_buffer_pct", 10.0) or 0)))
+        free_order_cap = max(0.0, free_balance * (1.0 - buffer_pct / 100.0))
+        bot_capital_in_use = await db.get_bot_capital_in_use()
+        capital_remaining = max(0.0, capital_limit - bot_capital_in_use)
+        slots_remaining = math.floor(capital_remaining / order_usdc) if order_usdc > 0 else 0
         max_slots_per_market = cfg["max_slots_per_market"]
-        slot_value = total_capital * slot_pct / 100.0  # USDC per slot
-        _max_order_usdc = float(cfg.get("max_order_usdc", 0) or 0)
-        if _max_order_usdc > 0:
-            slot_value = _max_order_usdc  # fixed order size drives all slot accounting
-
-        # Slots already consumed by open positions
-        slots_used = round(locked_usdc / slot_value) if slot_value > 0 else 0
-        slots_remaining = max(0, max_slots - slots_used)
 
         log.info(
-            "Capital: free=$%.2f locked=$%.2f total=$%.2f | slot=$%.2f used=%d/%d remaining=%d",
-            float(balance), locked_usdc, total_capital,
-            slot_value, slots_used, max_slots, slots_remaining,
+            "Capital: free=$%.2f usable_free=$%.2f bot_used=$%.2f limit=$%.2f | order=$%.2f remaining_slots=%d",
+            free_balance, free_order_cap, bot_capital_in_use, capital_limit, order_usdc, slots_remaining,
         )
 
-        # 3. Rebalance: cancel worst positions to make room for significantly better ones
-        await self._rebalance_risk(candidates, slots_remaining, slot_value, max_slots_per_market)
+        # 2. Rebalance: cancel worst positions to make room for significantly better ones
+        await self._rebalance_risk(candidates, slots_remaining, order_usdc, max_slots_per_market)
 
-        # 4. Re-fetch and enter new markets
+        # 3. Re-fetch and enter new markets
         open_positions = await db.get_open_positions()
         open_condition_ids = {p["condition_id"] for p in open_positions}
 
         # Recompute after potential rebalance
-        locked_usdc = await client.get_locked_usdc()
-        slots_used = round(locked_usdc / slot_value) if slot_value > 0 else 0
-        slots_remaining = max(0, max_slots - slots_used)
+        bot_capital_in_use = await db.get_bot_capital_in_use()
+        capital_remaining = max(0.0, capital_limit - bot_capital_in_use)
+        slots_remaining = math.floor(capital_remaining / order_usdc) if order_usdc > 0 else 0
 
         # Average score for super-deal detection
         avg_score = (sum(m.score for m in candidates) / len(candidates)) if candidates else 0
 
         log.info(
-            "Enter loop: %d candidates, %d slots remaining, avg_score=%.4f",
+            "Enter loop: %d candidates, %d capital slots remaining, avg_score=%.4f",
             len(candidates), slots_remaining, avg_score,
         )
 
         for market in candidates:
+            if order_usdc <= 0:
+                log.info("Skip entries: order_usdc must be > 0")
+                break
             if slots_remaining <= 0:
                 break
             if market.condition_id in open_condition_ids:
                 continue
 
-            # Determine slot multiplier based on score vs pool average
             ratio = market.score / avg_score if avg_score > 0 else 1.0
-            if ratio >= 4.0 and slots_remaining >= 4:
-                num_slots = min(4, max_slots_per_market, slots_remaining)
-            elif ratio >= 3.0 and slots_remaining >= 3:
-                num_slots = min(3, max_slots_per_market, slots_remaining)
-            elif ratio >= 2.0 and slots_remaining >= 2:
-                num_slots = min(2, max_slots_per_market, slots_remaining)
-            else:
-                num_slots = 1
-
-            market_budget = slot_value * num_slots
-            _max_order_usdc = float(cfg.get("max_order_usdc", 0) or 0)
-            if _max_order_usdc > 0:
-                market_budget = _max_order_usdc  # fixed order size set by user
+            market_budget = order_usdc
             if market_budget < market.min_order_cost:
                 log.info(
                     "Skip '%s': budget $%.2f < min_cost $%.2f",
                     market.question[:35], market_budget, market.min_order_cost,
                 )
                 continue
+            if market_budget > free_order_cap + 0.01:
+                log.info(
+                    "Skip '%s': order $%.2f > usable free balance $%.2f",
+                    market.question[:35], market_budget, free_order_cap,
+                )
+                break
+            if market_budget > capital_remaining + 0.01:
+                log.info(
+                    "Skip '%s': order $%.2f > bot capital remaining $%.2f",
+                    market.question[:35], market_budget, capital_remaining,
+                )
+                break
 
             log.info(
-                "Entering '%s' slots=%d budget=$%.2f score=%.4f (%.1f× avg)",
-                market.question[:40], num_slots, market_budget, market.score, ratio,
+                "Entering '%s' budget=$%.2f score=%.4f (%.1f× avg)",
+                market.question[:40], market_budget, market.score, ratio,
             )
             spent = await self._enter_market(market, market_budget, cfg["depth"])
             if spent > 0:
-                slots_remaining -= num_slots
+                free_order_cap = max(0.0, free_order_cap - spent)
+                capital_remaining = max(0.0, capital_remaining - spent)
+                slots_remaining = math.floor(capital_remaining / order_usdc) if order_usdc > 0 else 0
                 open_condition_ids.add(market.condition_id)
 
     # ── Rotating scanner ───────────────────────────────────────────────────────
@@ -215,10 +357,23 @@ class FarmingBot:
             self._rewards_cache_time = now
             self._rewards_cache_min_daily = min_daily
             self._scan_cursor = 0
+            self.scan_status.update({
+                "rewards_total": len(all_rewards),
+                "rewards_passing": len(self._rewards_cache),
+                "last_updated": now.isoformat(),
+            })
             log.info("Rewards cache refreshed: %d markets pass min_daily>=%.1f", len(self._rewards_cache), min_daily)
 
         total = len(self._rewards_cache)
         if total == 0:
+            self.scan_status.update({
+                "batch_size": 0,
+                "batch_scored": 0,
+                "pool_size": len(self._candidates_pool),
+                "shown": len(self._candidates_pool),
+                "cursor": self._scan_cursor,
+                "last_updated": now.isoformat(),
+            })
             return list(self._candidates_pool.values())
 
         # Take next batch from cursor (wrap around)
@@ -241,7 +396,6 @@ class FarmingBot:
             max_markets=SCAN_BATCH_SIZE,
             max_ob_spread=cfg["max_ob_spread"],
             max_daily_trades=cfg["max_daily_trades"],
-            max_bid_depth_spread=cfg.get("max_bid_depth_spread", 4.0),
         )
 
         # Merge into pool: update existing + add new
@@ -256,22 +410,30 @@ class FarmingBot:
                 if not any(w in m.question.lower() for w in word_bl)
             }
 
-        # Filter by budget: if max_order_usdc is set, exclude markets that can never be opened
-        _max_order_usdc = float(cfg.get("max_order_usdc", 0) or 0)
-        if _max_order_usdc > 0:
+        # Filter by fixed order budget: exclude markets that can never be opened.
+        order_usdc = max(0.0, float(cfg.get("order_usdc", 0) or 0))
+        if order_usdc > 0:
             self._candidates_pool = {
                 cid: m for cid, m in self._candidates_pool.items()
-                if m.min_order_cost <= _max_order_usdc
+                if m.min_order_cost <= order_usdc
             }
 
         # Prune pool: keep top POOL_MAX_SIZE by score
         pool_sorted = sorted(self._candidates_pool.values(), key=lambda m: m.score, reverse=True)
         self._candidates_pool = {m.condition_id: m for m in pool_sorted[:POOL_MAX_SIZE]}
 
-        slot_pct = cfg["slot_pct"]
-        _max_positions = int(cfg.get("max_positions", 0) or 0)
-        max_slots = _max_positions if _max_positions > 0 else max(1, int(100 / slot_pct))
-        return pool_sorted[:max_slots]
+        capital_limit = max(0.0, float(cfg.get("bot_capital_limit_usdc", 0) or 0))
+        max_slots = max(1, math.floor(capital_limit / order_usdc)) if order_usdc > 0 else 1
+        shown = pool_sorted[:max_slots]
+        self.scan_status.update({
+            "batch_size": len(batch),
+            "batch_scored": len(new_markets),
+            "pool_size": len(self._candidates_pool),
+            "shown": len(shown),
+            "cursor": self._scan_cursor,
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+        })
+        return shown
 
     # ── Risk rebalancing ───────────────────────────────────────────────────────
 
@@ -412,7 +574,7 @@ class FarmingBot:
 
     async def _enter_market(self, market: ScoredMarket, slot_budget: float, depth: str) -> float:
         """Place a single-sided BUY order on the more expensive token.
-        Uses the full slot_budget to maximize USDC locked → reward share.
+        Uses up to the fixed per-position budget.
         Returns total USDC spent."""
 
         if not market.tokens:
@@ -473,6 +635,12 @@ class FarmingBot:
         if order_cost > slot_budget + 0.01:
             size = min_size
             order_cost = size * target_price
+        if order_cost > slot_budget + 0.01:
+            log.info(
+                "Skip '%s': final cost $%.2f > budget $%.2f",
+                market.question[:40], order_cost, slot_budget,
+            )
+            return 0.0
 
         log.info(
             "Placing BUY %s @ %.3f size=%.0f cost≈$%.2f (budget=$%.2f) | %s",
@@ -480,29 +648,44 @@ class FarmingBot:
             slot_budget, market.question[:60],
         )
 
+        local_id = f"local-{uuid.uuid4().hex}"
+        placed_at = datetime.now(timezone.utc).isoformat()
+        await db.upsert_position({
+            "order_id": local_id,
+            "condition_id": market.condition_id,
+            "market_question": market.question,
+            "token_id": token_id,
+            "outcome": token.get("outcome", ""),
+            "side": "BUY",
+            "price": target_price,
+            "size": size,
+            "status": "PENDING_PLACE",
+            "placed_at": placed_at,
+            "filled_at": None,
+            "reward_earned": 0,
+            "local_id": local_id,
+            "source": "BOT",
+        })
+
         resp = await client.place_limit(token_id, target_price, size, "BUY")
         if resp is None:
+            await db.update_position_status(local_id, "FAILED")
             log.warning("Failed to place order for %s", market.condition_id)
+            return 0.0
+        if getattr(resp, "ok", True) is False:
+            await db.update_position_status(local_id, "FAILED")
+            log.warning("Rejected order for %s: %s", market.condition_id, getattr(resp, "message", "unknown"))
             return 0.0
 
         order_id = str(getattr(resp, "order_id", "") or getattr(resp, "id", ""))
         if not order_id:
+            await db.update_position_status(local_id, "FAILED")
             log.warning("No order_id in response for %s", market.condition_id)
             return 0.0
 
-        await db.upsert_position({
-            "order_id": order_id,
-            "condition_id": market.condition_id,
-            "market_question": market.question,
-            "token_id": token_id,
-            "side": "BUY",
-            "price": target_price,
-            "size": size,
-            "status": "OPEN",
-            "placed_at": datetime.now(timezone.utc).isoformat(),
-            "filled_at": None,
-            "reward_earned": 0,
-        })
+        post_status = str(getattr(resp, "status", "") or "").upper()
+        status = "FILLED" if post_status == "MATCHED" else "OPEN"
+        await db.replace_position_order_id(local_id, order_id, status=status)
         return order_cost
 
     # ── Monitor open positions ──────────────────────────────────────────────────
@@ -555,6 +738,7 @@ class FarmingBot:
                             "condition_id": pos["condition_id"],
                             "market_question": pos.get("market_question", ""),
                             "token_id": pos["token_id"],
+                            "outcome": pos.get("outcome", ""),
                             "side": "SELL",
                             "price": sell_price,
                             "size": pos["size"],
@@ -589,21 +773,7 @@ class FarmingBot:
                 cancelled = await client.cancel_order(order_id)
                 if cancelled:
                     await db.update_position_status(order_id, "CANCELLED")
-                    self._candidates_pool.pop(pos["condition_id"], None)
-                continue
-
-            # Check bid depth: gap between level 1 and level 4 too large
-            live_bids_for_depth = _extract_bids(order_book)
-            max_bid_depth = float(cfg.get("max_bid_depth_spread", 4.0))
-            depth_spread = bid_depth_spread_cents(live_bids_for_depth)
-            if depth_spread is not None and depth_spread > max_bid_depth:
-                log.info(
-                    "Cancel %s: bid depth spread %.1f¢ > max %.1f¢ (thin book) | %s",
-                    order_id, depth_spread, max_bid_depth, pos.get("market_question", "")[:45],
-                )
-                cancelled = await client.cancel_order(order_id)
-                if cancelled:
-                    await db.update_position_status(order_id, "CANCELLED")
+                    # Remove from pool so bot doesn't re-enter until next rescan
                     self._candidates_pool.pop(pos["condition_id"], None)
                 continue
 
@@ -765,10 +935,11 @@ class FarmingBot:
                 if sell_order_id:
                     await db.upsert_position({
                         "order_id": sell_order_id,
-                        "condition_id": pos["condition_id"],
-                        "market_question": pos.get("market_question", ""),
-                        "token_id": pos["token_id"],
-                        "side": "SELL",
+                            "condition_id": pos["condition_id"],
+                            "market_question": pos.get("market_question", ""),
+                            "token_id": pos["token_id"],
+                            "outcome": pos.get("outcome", ""),
+                            "side": "SELL",
                         "price": sell_price,
                         "size": pos["size"],
                         "status": "OPEN",
@@ -793,7 +964,12 @@ class FarmingBot:
 
     async def _load_cfg(self) -> dict:
         from src.config import settings as s
+        legacy_max_order = await db.get_setting("max_order_usdc", s.max_order_usdc)
+        legacy_order_default = legacy_max_order if float(legacy_max_order or 0) > 0 else s.order_usdc
         return {
+            "order_usdc":          await db.get_setting("order_usdc",          legacy_order_default),
+            "bot_capital_limit_usdc": await db.get_setting("bot_capital_limit_usdc", s.bot_capital_limit_usdc),
+            "free_balance_buffer_pct": await db.get_setting("free_balance_buffer_pct", s.free_balance_buffer_pct),
             "slot_pct":            await db.get_setting("slot_pct",            s.slot_pct),
             "max_slots_per_market":await db.get_setting("max_slots_per_market",s.max_slots_per_market),
             "scan_interval_s":     await db.get_setting("scan_interval_s",     s.scan_interval_s),
@@ -805,10 +981,9 @@ class FarmingBot:
             "max_ob_spread":       await db.get_setting("max_ob_spread",       s.max_ob_spread),
             "max_daily_trades":    await db.get_setting("max_daily_trades",    s.max_daily_trades),
             "monitor_interval_s":  await db.get_setting("monitor_interval_s",  s.monitor_interval_s),
-            "max_order_usdc":       await db.get_setting("max_order_usdc",       s.max_order_usdc),
-            "max_positions":        await db.get_setting("max_positions",        s.max_positions),
-            "word_blacklist":       await db.get_setting("word_blacklist",       s.word_blacklist),
-            "max_bid_depth_spread": await db.get_setting("max_bid_depth_spread", s.max_bid_depth_spread),
+            "max_order_usdc":      await db.get_setting("max_order_usdc",      s.max_order_usdc),
+            "max_positions":       await db.get_setting("max_positions",       s.max_positions),
+            "word_blacklist":      await db.get_setting("word_blacklist",      s.word_blacklist),
         }
 
 

@@ -15,7 +15,6 @@ from polymarket import (
     OrderResponse,
     Market,
 )
-
 from src.config import settings
 
 log = logging.getLogger(__name__)
@@ -108,6 +107,10 @@ class PMClient:
                 return None
 
     async def get_balance(self) -> Decimal:
+        balance, _reachable = await self.get_balance_status()
+        return balance
+
+    async def get_balance_status(self) -> tuple[Decimal, bool]:
         loop = asyncio.get_event_loop()
         for attempt in range(2):
             try:
@@ -115,14 +118,14 @@ class PMClient:
                     None,
                     lambda: self._secure().get_balance_allowance(asset_type="COLLATERAL"),
                 )
-                return Decimal(str(bal.balance)) / Decimal("1000000")
+                return Decimal(str(bal.balance)) / Decimal("1000000"), True
             except Exception as e:
                 if _is_conn_error(e) and attempt == 0:
                     log.warning("get_balance connection reset, retrying: %s", e)
                     self._reset()
                     continue
                 log.warning("get_balance: %s", e)
-                return Decimal("0")
+                return Decimal("0"), False
 
     # ── Order book ─────────────────────────────────────────────────────────────
 
@@ -266,6 +269,35 @@ class PMClient:
                     continue
                 log.warning("list_open_orders: %s", e)
                 return []
+
+    async def list_positions(self) -> list[Any]:
+        loop = asyncio.get_event_loop()
+        for attempt in range(2):
+            try:
+                paginator = await loop.run_in_executor(
+                    None,
+                    lambda: self._secure().list_positions(size_threshold=0.0001, page_size=100),
+                )
+                return list(paginator.items())
+            except Exception as e:
+                if _is_conn_error(e) and attempt == 0:
+                    log.warning("list_positions connection reset, retrying: %s", e)
+                    self._reset()
+                    continue
+                log.warning("list_positions: %s", e)
+                return []
+
+    async def get_token_position_size(self, token_id: str) -> float:
+        positions = await self.list_positions()
+        total = 0.0
+        for pos in positions:
+            if str(getattr(pos, "token_id", "") or "") != str(token_id):
+                continue
+            try:
+                total += float(getattr(pos, "size", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+        return total
 
     async def get_locked_usdc(self) -> float:
         """Return USDC actually locked in open BUY orders on Polymarket.
