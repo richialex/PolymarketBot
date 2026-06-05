@@ -14,7 +14,7 @@ from src.scanner import (
     enrich_batch, scan_markets,
     calc_order_price, calc_sell_order_price,
     mid_from_order_book,
-    _extract_bids, _extract_asks, _ob_spread_cents,
+    _extract_bids, _extract_asks, _ob_spread_cents, bid_depth_spread_cents,
     ScoredMarket,
 )
 
@@ -396,6 +396,7 @@ class FarmingBot:
             max_markets=SCAN_BATCH_SIZE,
             max_ob_spread=cfg["max_ob_spread"],
             max_daily_trades=cfg["max_daily_trades"],
+            max_bid_depth_spread=cfg.get("max_bid_depth_spread", 4.0),
         )
 
         # Merge into pool: update existing + add new
@@ -777,6 +778,21 @@ class FarmingBot:
                     self._candidates_pool.pop(pos["condition_id"], None)
                 continue
 
+            if pos.get("side") != "SELL":
+                live_bids_for_depth = _extract_bids(order_book)
+                max_bid_depth = float(cfg.get("max_bid_depth_spread", 4.0))
+                depth_spread = bid_depth_spread_cents(live_bids_for_depth)
+                if depth_spread is not None and depth_spread > max_bid_depth:
+                    log.info(
+                        "Cancel %s: bid depth spread %.1f¢ > max %.1f¢ (thin book) | %s",
+                        order_id, depth_spread, max_bid_depth, pos.get("market_question", "")[:45],
+                    )
+                    cancelled = await client.cancel_order(order_id)
+                    if cancelled:
+                        await db.update_position_status(order_id, "CANCELLED")
+                        self._candidates_pool.pop(pos["condition_id"], None)
+                    continue
+
             market_info = candidate_map.get(pos["condition_id"])
             spread = market_info.rewards_max_spread if market_info else 0.04
             current_price = pos["price"]
@@ -980,6 +996,7 @@ class FarmingBot:
             "min_spread":          await db.get_setting("min_spread",          s.min_spread),
             "max_ob_spread":       await db.get_setting("max_ob_spread",       s.max_ob_spread),
             "max_daily_trades":    await db.get_setting("max_daily_trades",    s.max_daily_trades),
+            "max_bid_depth_spread": await db.get_setting("max_bid_depth_spread", s.max_bid_depth_spread),
             "monitor_interval_s":  await db.get_setting("monitor_interval_s",  s.monitor_interval_s),
             "max_order_usdc":      await db.get_setting("max_order_usdc",      s.max_order_usdc),
             "max_positions":       await db.get_setting("max_positions",       s.max_positions),

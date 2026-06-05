@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     volatility_threshold: float = 0.05
     min_spread: float = 2.0        # minimum rewards_max_spread in cents (±¢ from mid)
     max_ob_spread: float = 2.0     # maximum actual bid-ask spread in cents (order book quality filter)
+    max_bid_depth_spread: float = 4.0  # max gap between bid levels 1 and 4 on the buy token
     max_daily_trades: int = 3      # max price changes per day — markets with more are skipped
     monitor_interval_s: int = 5   # seconds between position checks in monitor loop
 

@@ -406,6 +406,7 @@ class BotSettings(BaseModel):
     volatility_threshold: float | None = None
     min_spread: float | None = None
     max_ob_spread: float | None = None
+    max_bid_depth_spread: float | None = None
     max_daily_trades: int | None = None
     monitor_interval_s: int | None = None
     max_order_usdc: float | None = None
@@ -432,6 +433,7 @@ async def get_settings():
         "volatility_threshold": cfg.volatility_threshold,
         "min_spread":           cfg.min_spread,
         "max_ob_spread":        cfg.max_ob_spread,
+        "max_bid_depth_spread": cfg.max_bid_depth_spread,
         "max_daily_trades":     cfg.max_daily_trades,
         "monitor_interval_s":   cfg.monitor_interval_s,
         "max_order_usdc":       cfg.max_order_usdc,

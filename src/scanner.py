@@ -95,6 +95,7 @@ async def enrich_batch(
     max_markets: int = 200,
     max_ob_spread: float = 2.0,
     max_daily_trades: int = 3,
+    max_bid_depth_spread: float = 4.0,
 ) -> list[ScoredMarket]:
     """Enrich a pre-selected list of CurrentReward objects → ScoredMarket list."""
     blacklist = {c.lower() for c in (category_blacklist or [])} | BLACKLISTED_CATEGORIES
@@ -171,17 +172,25 @@ async def enrich_batch(
                 token_mid = mid_from_order_book(ob) or float(t["price"])
                 top4_liq += _zone_liquidity_usd(ob, token_mid, max_spread)
 
-            yes_bids = all_bids_map.get(yes_token_id, [])
-
             # Hard filter: bid-ask spread too wide on the token we will actually BUY.
             # We buy the expensive token (price > 0.50), so check its spread — not always YES.
             expensive_idx = max(range(len(token_list)), key=lambda i: float(token_list[i]["price"]))
             expensive_ob = all_obs[expensive_idx] if expensive_idx < len(all_obs) else all_obs[0] if all_obs else None
+            expensive_token_id = token_list[expensive_idx]["token_id"]
             ob_spread = _ob_spread_cents(expensive_ob)
             if ob_spread is not None and ob_spread > max_ob_spread:
                 log.debug(
                     "Skip %s: bid-ask spread %.1f¢ > max %.1f¢ (on expensive token)",
                     question[:40], ob_spread, max_ob_spread,
+                )
+                continue
+
+            # Hard filter: bid depth too thin on the token we will actually BUY.
+            depth_spread = bid_depth_spread_cents(all_bids_map.get(expensive_token_id, []))
+            if depth_spread is not None and depth_spread > max_bid_depth_spread:
+                log.debug(
+                    "Skip %s: bid depth spread %.1f¢ > max %.1f¢ (on expensive token)",
+                    question[:40], depth_spread, max_bid_depth_spread,
                 )
                 continue
 
@@ -484,6 +493,16 @@ def _ob_spread_cents(order_book) -> float | None:
     if not bids or not asks:
         return None
     return (asks[0] - bids[0]) * 100
+
+
+def bid_depth_spread_cents(bids: list[float]) -> float | None:
+    """Spread between 1st and 4th unique bid levels in cents.
+    Less than 4 levels means the book is too thin and should fail the filter.
+    """
+    levels = sorted(set(round(b, 2) for b in bids), reverse=True)
+    if len(levels) < 4:
+        return 999.0
+    return round((levels[0] - levels[3]) * 100, 1)
 
 
 def mid_from_order_book(order_book) -> float | None:

@@ -76,6 +76,10 @@
           Макс. спред стакана, ¢
           <input id="s-max-ob-spread" type="number" min="0.5" max="20" step="0.5" value="2" />
         </label>
+        <label title="Макс. разница между 1-м и 4-м bid-уровнем токена, который бот покупает. Меньше 4 уровней считается тонким стаканом">
+          Макс. глубина bid, ¢
+          <input id="s-max-bid-depth" type="number" min="1" max="30" step="0.5" value="4" />
+        </label>
         <label title="Макс. изменений цены в день. Рынки активнее этого порога — не мёртвые, пропускаются">
           Макс. сделок в день
           <input id="s-max-daily-trades" type="number" min="0" max="50" step="1" value="3" />
