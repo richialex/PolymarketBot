@@ -46,6 +46,7 @@
 ### Scanner / Trading Logic
 
 - Fixed `/api/markets/refresh` crash caused by missing `max_slots` key.
+- Added buy-side bid depth filter (`max_bid_depth_spread`) so markets with fewer than 4 bid levels or a large gap between bid levels 1-4 on the token the bot will actually buy are skipped/cancelled as thin books.
 - Changed market candidate filtering to use fixed `order_usdc` budget.
 - Removed oversized "super-deal" multi-slot order sizing; one entry now uses one fixed position budget.
 - Kept rebalance behavior, but reinterpreted `max_slots_per_market` as max cancellations per rebalance instead of allowing larger order size.
