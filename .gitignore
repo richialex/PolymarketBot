@@ -6,7 +6,7 @@
 *.db-journal
 
 # Logs
-*.log
+logs
 
 # Python
 __pycache__/
