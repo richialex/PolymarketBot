@@ -5,6 +5,8 @@ let botRunning = false;
 let lastPositions = [];
 let expandedConditions = new Set();
 let conditionHistory = {};
+let settingsOpen = false;
+let marketsOpen = false;
 let historyOpen = false;
 let historyOffset = 0;
 const historyLimit = 10;
@@ -48,7 +50,6 @@ async function fetchStatus() {
     updateOrderBudgetLimit();
   }
   document.getElementById('active-count').textContent = data.active_positions;
-  document.getElementById('earned').textContent = '$' + fmt4(data.total_earned);
 
   const badge = document.getElementById('bot-status');
   const btn   = document.getElementById('btn-toggle');
@@ -313,9 +314,24 @@ async function cancelAll() {
 
 async function toggleHistory() {
   historyOpen = !historyOpen;
+  document.querySelector('.history-card')?.classList.toggle('is-open', historyOpen);
   document.getElementById('history-panel').style.display = historyOpen ? '' : 'none';
   document.getElementById('history-toggle').textContent = historyOpen ? '▲' : '▼';
   if (historyOpen) await fetchHistory();
+}
+
+function toggleSettings() {
+  settingsOpen = !settingsOpen;
+  document.querySelector('.settings-card')?.classList.toggle('is-open', settingsOpen);
+  document.getElementById('settings-panel').style.display = settingsOpen ? '' : 'none';
+  document.getElementById('settings-toggle').textContent = settingsOpen ? '▲' : '▼';
+}
+
+function toggleMarkets() {
+  marketsOpen = !marketsOpen;
+  document.querySelector('.markets-card')?.classList.toggle('is-open', marketsOpen);
+  document.getElementById('markets-panel').style.display = marketsOpen ? '' : 'none';
+  document.getElementById('markets-toggle').textContent = marketsOpen ? '▲' : '▼';
 }
 
 async function fetchHistory() {
@@ -500,60 +516,21 @@ async function fetchStats() {
   const data = await get('/api/stats');
   if (!data) return;
 
-  document.getElementById('st-balance').textContent = '$' + fmt2(data.current_balance);
-
   const delta = data.balance_delta_24h;
-  const deltaEl = document.getElementById('st-delta-24h');
+  const deltaEl = document.getElementById('header-delta-24h');
   if (delta == null) {
     deltaEl.textContent = 'нет данных';
+    deltaEl.style.color = '';
   } else {
     deltaEl.textContent = (delta >= 0 ? '+' : '') + fmt4(delta) + '$';
     deltaEl.style.color = delta >= 0 ? 'var(--green)' : 'var(--red)';
   }
 
-  const estEl = document.getElementById('st-est-daily');
+  const estEl = document.getElementById('header-est-daily');
   estEl.textContent = '$' + fmt4(data.est_daily_earnings) + '/день';
   estEl.style.color = data.est_daily_earnings > 0 ? 'var(--green)' : '';
 
-  document.getElementById('st-invested').textContent = '$' + fmt4(data.invested_usdc);
-  document.getElementById('st-total').textContent = data.total;
-  document.getElementById('st-filled-cancelled').textContent =
-    data.filled + ' / ' + data.cancelled;
-
-  if (data.balance_history && data.balance_history.length > 1) {
-    drawBalanceChart(data.balance_history);
-  }
-}
-
-function drawBalanceChart(history) {
-  const canvas = document.getElementById('balance-chart');
-  if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const W = canvas.offsetWidth || 600;
-  const H = 60;
-  canvas.width = W;
-  canvas.height = H;
-  ctx.clearRect(0, 0, W, H);
-
-  const vals = history.map(h => h.balance);
-  const min = Math.min(...vals);
-  const max = Math.max(...vals);
-  const range = max - min || 1;
-
-  ctx.beginPath();
-  ctx.strokeStyle = '#6c63ff';
-  ctx.lineWidth = 1.5;
-  vals.forEach((v, i) => {
-    const x = (i / (vals.length - 1)) * W;
-    const y = H - ((v - min) / range) * (H - 12) - 4;
-    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-  });
-  ctx.stroke();
-
-  ctx.fillStyle = '#7c8db0';
-  ctx.font = '10px sans-serif';
-  ctx.fillText('$' + fmt2(min), 2, H - 2);
-  ctx.fillText('$' + fmt2(max), 2, 11);
+  document.getElementById('header-invested').textContent = '$' + fmt4(data.invested_usdc);
 }
 
 // ── Start ─────────────────────────────────────────────────────────────────────
