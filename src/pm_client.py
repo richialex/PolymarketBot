@@ -51,6 +51,14 @@ class PMClient:
             )
         return self._sec
 
+    def ws_auth(self) -> dict[str, str]:
+        creds = self._secure().credentials
+        return {
+            "apiKey": creds.key,
+            "secret": creds.secret,
+            "passphrase": creds.passphrase,
+        }
+
     # ── Rewards ────────────────────────────────────────────────────────────────
 
     async def get_all_rewards(self) -> list[CurrentReward]:
@@ -190,6 +198,7 @@ class PMClient:
                         size=Decimal(str(size)),
                         side=side,
                         post_only=True,
+                        builder_code=settings.builder_code.strip() or None,
                     ),
                 )
             except Exception as e:

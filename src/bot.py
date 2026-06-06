@@ -17,6 +17,7 @@ from src.scanner import (
     _extract_bids, _extract_asks, _ob_spread_cents, bid_depth_spread_cents,
     ScoredMarket,
 )
+from src.user_ws import UserWsWatcher
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +37,8 @@ class FarmingBot:
         self._scan_task: asyncio.Task | None = None
         self._trader_task: asyncio.Task | None = None
         self._monitor_task: asyncio.Task | None = None
+        self._user_ws_task: asyncio.Task | None = None
+        self._user_ws = UserWsWatcher()
         self.last_scan: list[ScoredMarket] = []
         self.errors: list[str] = []
         self._last_depth: str | None = None
@@ -67,16 +70,18 @@ class FarmingBot:
         self._scan_task = asyncio.create_task(self._scanner_loop())
         self._trader_task = asyncio.create_task(self._trader_loop())
         self._monitor_task = asyncio.create_task(self._monitor_loop())
+        self._user_ws_task = asyncio.create_task(self._user_ws.run())
         log.info("FarmingBot started")
 
     def stop(self) -> None:
         self.running = False
-        for t in (self._scan_task, self._trader_task, self._monitor_task):
+        for t in (self._scan_task, self._trader_task, self._monitor_task, self._user_ws_task):
             if t:
                 t.cancel()
         self._scan_task = None
         self._trader_task = None
         self._monitor_task = None
+        self._user_ws_task = None
         log.info("FarmingBot stopped")
 
     async def reconcile(self) -> dict:

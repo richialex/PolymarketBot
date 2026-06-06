@@ -19,15 +19,10 @@ from src.bot import bot
 from src.pm_client import client
 from src.scanner import calc_sell_order_price, mid_from_order_book, _extract_asks
 from src.config import settings as cfg
+from src.logging_setup import configure_logging
 
+configure_logging()
 log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-
-# Always write to bot.log so we can debug even after console closes
-_fh = logging.FileHandler("bot.log", encoding="utf-8")
-_fh.setLevel(logging.INFO)
-_fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-logging.getLogger().addHandler(_fh)
 
 STATIC_DIR = Path(__file__).parent.parent / "static"
 

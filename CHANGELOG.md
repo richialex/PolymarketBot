@@ -16,6 +16,7 @@
 - Added final order-cost guard so reward `min_size` cannot force an order above configured per-position budget.
 - Split long synchronous bot tick into separate scanner, trader, and monitor async loops so active order management is not blocked by market scanning.
 - Prevented empty scan results at startup/API failure from being treated as a reason to close all active positions.
+- Added daily log rotation under `logs/` so runtime logs no longer grow into one unbounded `bot.log`.
 
 ### Position Management
 
@@ -31,6 +32,9 @@
 - Added local history tracking for old/cancelled/filled orders.
 - Moved inactive orders out of `Активные позиции` into a collapsible history section.
 - Added expandable per-market history under active positions.
+- Added private Polymarket user WebSocket monitoring for bot order events.
+- Added dynamic user WebSocket subscriptions for active bot markets, with delayed unsubscribe.
+- Added safe WebSocket-driven local cancellation updates for `CANCELLATION/CANCELED` order events.
 
 ### UI Improvements
 
@@ -54,6 +58,7 @@
   - free balance is used only as "can we open now";
   - bot capital limit is calculated from bot-managed exposure;
   - manual orders do not affect bot exposure.
+- Added a logging-only WebSocket probe for validating private user events and active-market order book streams.
 
 ### Data Model
 
@@ -64,7 +69,8 @@
 
 ### Future Work
 
-- Add Polymarket authenticated user WebSocket as event source for own order/trade updates.
 - Add global REST rate limiter and exponential backoff for `429`, `5xx`, and timeout responses.
-- Reduce REST polling after WebSocket event handling is verified.
+- Add WebSocket fill/trade handling after a real fill payload is observed.
+- Reduce REST polling after WebSocket fill handling is verified.
+- Add active-position market WebSocket book cache after REST/WS book parity is validated.
 - Add round-robin monitor mode for large position counts.

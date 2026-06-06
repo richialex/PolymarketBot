@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     wallet_address: str = Field(alias="WALLET_ADDRESS")
     private_key: str = Field(alias="PRIVATE_KEY")
     api_key: str = Field(alias="API_KEY")
+    builder_code: str = Field(default="0x5fca799bf0816c0e257ed8553ca29930f19635970b92e2d7fc168d63f3731182", alias="BUILDER_CODE")
 
     # Optional proxy (http://user:pass@host:port  or  socks5://host:port)
     https_proxy: str = Field(default="", alias="HTTPS_PROXY")
