@@ -7,6 +7,7 @@ import random as _random
 import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
+from typing import Any
 
 from src.pm_client import client
 
@@ -62,6 +63,28 @@ class ScoredMarket:
     min_order_cost: float = 0.0    # cheapest token × min_size (min USDC to qualify for rewards)
 
 
+@dataclass(frozen=True)
+class RewardTokenSnapshot:
+    token_id: str
+    outcome: str
+    price: float
+
+
+@dataclass(frozen=True)
+class MultiRewardMarket:
+    condition_id: str
+    question: str
+    market_slug: str
+    event_slug: str
+    rewards_min_size: float
+    rewards_max_spread: float
+    market_competitiveness: float
+    tokens: tuple[RewardTokenSnapshot, ...]
+    total_daily_rate: float
+    end_date: str | None = None
+    volume_24hr: float = 0.0
+
+
 async def scan_markets(
     min_daily_reward: float = 1.0,
     deposit_pct: float = 50.0,
@@ -96,6 +119,7 @@ async def enrich_batch(
     max_ob_spread: float = 2.0,
     max_daily_trades: int = 3,
     max_bid_depth_spread: float = 4.0,
+    market_rewards: list | None = None,
 ) -> list[ScoredMarket]:
     """Enrich a pre-selected list of CurrentReward objects → ScoredMarket list."""
     blacklist = {c.lower() for c in (category_blacklist or [])} | BLACKLISTED_CATEGORIES
@@ -107,7 +131,8 @@ async def enrich_batch(
     now = datetime.now(timezone.utc)
     min_end = now + timedelta(days=30)  # must have ≥30 days until expiry
 
-    market_rewards = await _batch_fetch_market_rewards(candidates)
+    if market_rewards is None:
+        market_rewards = await _batch_fetch_market_rewards(candidates)
 
     for reward, mr in zip(candidates, market_rewards):
         try:
@@ -201,6 +226,20 @@ async def enrich_batch(
             # ── Step 4: end date + category (Rule 2 check) ───────────────────
             end_date_str: str | None = None
             category = ""
+            end_date_val = getattr(mr, "end_date", None)
+            if end_date_val is not None:
+                try:
+                    if isinstance(end_date_val, str):
+                        end_dt = datetime.fromisoformat(end_date_val.replace("Z", "+00:00"))
+                    else:
+                        end_dt = end_date_val
+                        if end_dt.tzinfo is None:
+                            end_dt = end_dt.replace(tzinfo=timezone.utc)
+                    if end_dt < min_end:
+                        continue
+                    end_date_str = end_dt.isoformat()
+                except (ValueError, AttributeError):
+                    pass
             if market_slug:
                 market = await client.get_market_by_slug(market_slug)
                 if market:
@@ -209,7 +248,7 @@ async def enrich_batch(
                     if end_date_val is None and state:
                         end_date_val = getattr(state, "end_date", None)
 
-                    if end_date_val is not None:
+                    if end_date_str is None and end_date_val is not None:
                         try:
                             if isinstance(end_date_val, str):
                                 end_dt = datetime.fromisoformat(end_date_val.replace("Z", "+00:00"))
@@ -317,6 +356,50 @@ async def _batch_fetch_market_rewards(rewards, concurrency: int = 10):
             return await client.get_market_reward(r.condition_id)
 
     return await asyncio.gather(*[fetch_one(r) for r in rewards])
+
+
+def multi_reward_from_api(item: dict[str, Any]) -> MultiRewardMarket | None:
+    condition_id = str(item.get("condition_id") or "")
+    if not condition_id:
+        return None
+    tokens = []
+    for token in item.get("tokens") or []:
+        if not isinstance(token, dict):
+            continue
+        token_id = str(token.get("token_id") or "")
+        if not token_id:
+            continue
+        tokens.append(RewardTokenSnapshot(
+            token_id=token_id,
+            outcome=str(token.get("outcome") or ""),
+            price=_to_float_default(token.get("price"), 0.0),
+        ))
+    if not tokens:
+        return None
+    daily = 0.0
+    for cfg in item.get("rewards_config") or []:
+        if isinstance(cfg, dict):
+            daily += _to_float_default(cfg.get("rate_per_day"), 0.0)
+    return MultiRewardMarket(
+        condition_id=condition_id,
+        question=str(item.get("question") or condition_id),
+        market_slug=str(item.get("market_slug") or ""),
+        event_slug=str(item.get("event_slug") or ""),
+        rewards_min_size=_to_float_default(item.get("rewards_min_size"), 20.0),
+        rewards_max_spread=_to_float_default(item.get("rewards_max_spread"), 0.05),
+        market_competitiveness=_to_float_default(item.get("market_competitiveness"), 0.0),
+        tokens=tuple(tokens),
+        total_daily_rate=daily,
+        end_date=str(item.get("end_date") or "") or None,
+        volume_24hr=_to_float_default(item.get("volume_24hr"), 0.0),
+    )
+
+
+def _to_float_default(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def calc_order_price(

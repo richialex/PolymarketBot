@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time
 import uuid
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -15,8 +16,9 @@ from src.scanner import (
     calc_order_price, calc_sell_order_price,
     mid_from_order_book,
     _extract_bids, _extract_asks, _ob_spread_cents, bid_depth_spread_cents,
-    ScoredMarket,
+    multi_reward_from_api, ScoredMarket,
 )
+from src.market_ws import MarketWsWatcher
 from src.user_ws import UserWsWatcher
 
 log = logging.getLogger(__name__)
@@ -29,6 +31,7 @@ POOL_MAX_SIZE    = 50    # best candidates kept in memory across ticks
 
 MONITOR_INTERVAL = 5   # seconds between position checks
 TRADE_INTERVAL = 10    # seconds between trade decisions when scanner runs separately
+ORDER_STATUS_REST_INTERVAL_S = 30
 
 
 class FarmingBot:
@@ -38,16 +41,20 @@ class FarmingBot:
         self._trader_task: asyncio.Task | None = None
         self._monitor_task: asyncio.Task | None = None
         self._user_ws_task: asyncio.Task | None = None
+        self._market_ws_task: asyncio.Task | None = None
         self._user_ws = UserWsWatcher()
+        self._market_ws = MarketWsWatcher()
         self.last_scan: list[ScoredMarket] = []
         self.errors: list[str] = []
         self._last_depth: str | None = None
         self._scan_lock = asyncio.Lock()
+        self._last_order_status_check: dict[str, float] = {}
 
         # Rotating scanner state
         self._rewards_cache: list = []
         self._rewards_cache_time: datetime | None = None
         self._rewards_cache_min_daily: float | None = None  # min_daily used when cache was built
+        self._rewards_cache_scanner_mode: str | None = None
         self._scan_cursor: int = 0
         self._candidates_pool: dict[str, ScoredMarket] = {}  # best seen across all ticks
         self.scan_status: dict = {
@@ -59,6 +66,7 @@ class FarmingBot:
             "shown": 0,
             "cursor": 0,
             "last_updated": None,
+            "scanner_mode": "legacy",
         }
 
     # ── Public API ──────────────────────────────────────────────────────────────
@@ -71,17 +79,19 @@ class FarmingBot:
         self._trader_task = asyncio.create_task(self._trader_loop())
         self._monitor_task = asyncio.create_task(self._monitor_loop())
         self._user_ws_task = asyncio.create_task(self._user_ws.run())
+        self._market_ws_task = asyncio.create_task(self._market_ws.run())
         log.info("FarmingBot started")
 
     def stop(self) -> None:
         self.running = False
-        for t in (self._scan_task, self._trader_task, self._monitor_task, self._user_ws_task):
+        for t in (self._scan_task, self._trader_task, self._monitor_task, self._user_ws_task, self._market_ws_task):
             if t:
                 t.cancel()
         self._scan_task = None
         self._trader_task = None
         self._monitor_task = None
         self._user_ws_task = None
+        self._market_ws_task = None
         log.info("FarmingBot stopped")
 
     async def reconcile(self) -> dict:
@@ -181,6 +191,21 @@ class FarmingBot:
         expected = float(pos.get("size", 0) or 0)
         actual = await client.get_token_position_size(token_id)
         return actual >= max(0.0001, min(expected, 0.0001))
+
+    async def _get_order_book_ws_first(self, token_id: str, purpose: str):
+        order_book = await self._market_ws.get_order_book(token_id)
+        if order_book is not None:
+            return order_book
+        log.info("MARKET_WS fallback_rest purpose=%s token=%s", purpose, _short_id(token_id))
+        return await client.get_order_book(token_id)
+
+    def _should_check_order_status(self, order_id: str, interval_s: int = ORDER_STATUS_REST_INTERVAL_S) -> bool:
+        now = time.monotonic()
+        last = self._last_order_status_check.get(order_id, 0.0)
+        if now - last < interval_s:
+            return False
+        self._last_order_status_check[order_id] = now
+        return True
 
     # ── Main loop ───────────────────────────────────────────────────────────────
 
@@ -345,6 +370,15 @@ class FarmingBot:
         """Cycle through ALL reward markets in batches, accumulating the best in a pool."""
         now = datetime.now(timezone.utc)
         min_daily = cfg["min_daily_reward"]
+        scanner_mode = str(cfg.get("scanner_mode") or "legacy").lower()
+        if scanner_mode not in ("legacy", "multi"):
+            scanner_mode = "legacy"
+        mode_changed = self._rewards_cache_scanner_mode not in (None, scanner_mode)
+        if mode_changed:
+            log.info("scanner_mode changed %s -> %s, resetting rewards cache and pool", self._rewards_cache_scanner_mode, scanner_mode)
+            self._rewards_cache.clear()
+            self._candidates_pool.clear()
+            self._scan_cursor = 0
 
         # Refresh the full rewards list every REWARDS_CACHE_TTL seconds
         cache_age = (now - self._rewards_cache_time).total_seconds() if self._rewards_cache_time else 9999
@@ -354,20 +388,26 @@ class FarmingBot:
                 log.info("min_daily_reward changed %.1f → %.1f, forcing cache refresh + pool reset", self._rewards_cache_min_daily, min_daily)
                 self._candidates_pool.clear()
             from src.pm_client import client as _c
-            all_rewards = await _c.get_all_rewards()
+            if scanner_mode == "multi":
+                raw_rewards = await _c.get_reward_markets_multi()
+                all_rewards = [m for m in (multi_reward_from_api(item) for item in raw_rewards) if m is not None]
+            else:
+                all_rewards = await _c.get_all_rewards()
             self._rewards_cache = [
                 r for r in all_rewards
                 if float(getattr(r, "total_daily_rate", 0) or 0) >= min_daily
             ]
             self._rewards_cache_time = now
             self._rewards_cache_min_daily = min_daily
+            self._rewards_cache_scanner_mode = scanner_mode
             self._scan_cursor = 0
             self.scan_status.update({
                 "rewards_total": len(all_rewards),
                 "rewards_passing": len(self._rewards_cache),
                 "last_updated": now.isoformat(),
+                "scanner_mode": scanner_mode,
             })
-            log.info("Rewards cache refreshed: %d markets pass min_daily>=%.1f", len(self._rewards_cache), min_daily)
+            log.info("Rewards cache refreshed mode=%s: %d markets pass min_daily>=%.1f", scanner_mode, len(self._rewards_cache), min_daily)
 
         total = len(self._rewards_cache)
         if total == 0:
@@ -378,6 +418,7 @@ class FarmingBot:
                 "shown": len(self._candidates_pool),
                 "cursor": self._scan_cursor,
                 "last_updated": now.isoformat(),
+                "scanner_mode": scanner_mode,
             })
             return list(self._candidates_pool.values())
 
@@ -402,6 +443,7 @@ class FarmingBot:
             max_ob_spread=cfg["max_ob_spread"],
             max_daily_trades=cfg["max_daily_trades"],
             max_bid_depth_spread=cfg.get("max_bid_depth_spread", 4.0),
+            market_rewards=batch if scanner_mode == "multi" else None,
         )
 
         # Merge into pool: update existing + add new
@@ -438,6 +480,7 @@ class FarmingBot:
             "shown": len(shown),
             "cursor": self._scan_cursor,
             "last_updated": datetime.now(timezone.utc).isoformat(),
+            "scanner_mode": scanner_mode,
         })
         return shown
 
@@ -702,7 +745,13 @@ class FarmingBot:
 
         open_positions = await db.get_open_positions()
         if not open_positions:
+            self._last_order_status_check.clear()
             return
+        open_order_ids = {str(p.get("order_id") or "") for p in open_positions}
+        self._last_order_status_check = {
+            oid: ts for oid, ts in self._last_order_status_check.items()
+            if oid in open_order_ids
+        }
 
         depth = cfg["depth"]
         depth_changed = self._last_depth is not None and depth != self._last_depth
@@ -714,11 +763,10 @@ class FarmingBot:
 
         for pos in open_positions:
             order_id = pos["order_id"]
-            order = await client.get_order(order_id)
-            if order is None:
-                continue
-
-            status = str(getattr(order, "status", "") or "").upper()
+            status = ""
+            if self._should_check_order_status(order_id):
+                order = await client.get_order(order_id)
+                status = str(getattr(order, "status", "") or "").upper() if order else ""
 
             if status in ("FILLED", "MATCHED"):
                 log.warning("Order %s FILLED! Placing sell at front of ask queue.", order_id)
@@ -727,7 +775,7 @@ class FarmingBot:
                     filled_at=datetime.now(timezone.utc).isoformat(),
                 )
                 # Get live order book to place sell at optimal ask price
-                ob_for_sell = await client.get_order_book(pos["token_id"])
+                ob_for_sell = await self._get_order_book_ws_first(pos["token_id"], "filled_buy_sell")
                 live_mid_sell = mid_from_order_book(ob_for_sell)
                 live_asks = _extract_asks(ob_for_sell)
                 market_info = candidate_map.get(pos["condition_id"])
@@ -765,7 +813,7 @@ class FarmingBot:
                 continue
 
             # Get live order book data (used by both BUY and SELL logic)
-            order_book = await client.get_order_book(pos["token_id"])
+            order_book = await self._get_order_book_ws_first(pos["token_id"], "monitor")
             live_mid = mid_from_order_book(order_book)
 
             # ── Check 1: spread widened beyond threshold → exit position ─────
@@ -933,7 +981,7 @@ class FarmingBot:
                 "Recovering missing SELL for filled BUY %s | %s",
                 pos["order_id"], pos.get("market_question", "")[:50],
             )
-            ob = await client.get_order_book(pos["token_id"])
+            ob = await self._get_order_book_ws_first(pos["token_id"], "recover_sell")
             if ob is None:
                 # Orderbook gone → market resolved/closed; stop retrying
                 log.info(
@@ -994,6 +1042,7 @@ class FarmingBot:
             "slot_pct":            await db.get_setting("slot_pct",            s.slot_pct),
             "max_slots_per_market":await db.get_setting("max_slots_per_market",s.max_slots_per_market),
             "scan_interval_s":     await db.get_setting("scan_interval_s",     s.scan_interval_s),
+            "scanner_mode":        await db.get_setting("scanner_mode",        s.scanner_mode),
             "min_daily_reward":    await db.get_setting("min_daily_reward",    s.min_daily_reward),
             "depth":               await db.get_setting("depth",               s.depth),
             "category_blacklist":  await db.get_setting("category_blacklist",  s.category_blacklist),
@@ -1010,3 +1059,9 @@ class FarmingBot:
 
 
 bot = FarmingBot()
+
+
+def _short_id(value: str, head: int = 10, tail: int = 6) -> str:
+    if not value:
+        return "?"
+    return value if len(value) <= head + tail + 1 else f"{value[:head]}...{value[-tail:]}"

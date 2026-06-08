@@ -395,6 +395,7 @@ class BotSettings(BaseModel):
     slot_pct: float | None = None
     max_slots_per_market: int | None = None
     scan_interval_s: int | None = None
+    scanner_mode: str | None = None
     min_daily_reward: float | None = None
     depth: str | None = None
     category_blacklist: list[str] | None = None
@@ -422,6 +423,7 @@ async def get_settings():
         "slot_pct":             cfg.slot_pct,
         "max_slots_per_market": cfg.max_slots_per_market,
         "scan_interval_s":      cfg.scan_interval_s,
+        "scanner_mode":         cfg.scanner_mode,
         "min_daily_reward":     cfg.min_daily_reward,
         "depth":                cfg.depth,
         "category_blacklist":   cfg.category_blacklist,
@@ -443,6 +445,9 @@ async def get_settings():
 @app.put("/api/settings")
 async def update_settings(body: BotSettings):
     data = body.model_dump(exclude_none=True)
+    if "scanner_mode" in data:
+        mode = str(data["scanner_mode"] or "legacy").lower()
+        data["scanner_mode"] = mode if mode in ("legacy", "multi") else "legacy"
     if "order_usdc" in data:
         data["order_usdc"] = max(0.0, float(data["order_usdc"]))
     if "bot_capital_limit_usdc" in data:

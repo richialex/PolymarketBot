@@ -76,6 +76,13 @@
             Интервал сканирования, сек
             <input id="s-interval" type="number" min="10" step="10" value="60" />
           </label>
+          <label title="Источник первичного поиска reward-рынков. Legacy — текущий SDK-путь, Multi — новый /rewards/markets/multi.">
+            Режим поиска рынков
+            <select id="s-scanner-mode">
+              <option value="legacy">Legacy</option>
+              <option value="multi">Multi</option>
+            </select>
+          </label>
           <label>
             Порог волатильности
             <input id="s-volatility" type="number" min="0.001" max="1" step="0.005" value="0.03" />
@@ -272,6 +279,6 @@
     </section>
   </main>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=scanner-mode-2"></script>
 </body>
 </html>

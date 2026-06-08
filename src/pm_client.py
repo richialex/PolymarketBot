@@ -6,6 +6,7 @@ import logging
 from decimal import Decimal
 from typing import Any
 
+import httpx
 from polymarket import (
     PublicClient, SecureClient,
     CurrentReward, MarketReward,
@@ -95,6 +96,66 @@ class PMClient:
                     continue
                 log.warning("get_market_reward %s: %s", condition_id, e)
                 return None
+
+    async def get_reward_markets_multi(
+        self,
+        *,
+        page_size: int = 500,
+        max_pages: int = 20,
+        order_by: str = "rate_per_day",
+        position: str = "DESC",
+    ) -> list[dict[str, Any]]:
+        """Fetch active reward markets from the raw multi endpoint.
+
+        The installed SDK does not expose /rewards/markets/multi yet, so keep
+        this as a narrow raw HTTP wrapper until the SDK grows a typed method.
+        """
+        page_size = min(500, max(1, int(page_size)))
+        params: dict[str, Any] = {
+            "page_size": page_size,
+            "order_by": order_by,
+            "position": position,
+        }
+        out: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        seen_conditions: set[str] = set()
+        for page in range(max(1, int(max_pages))):
+            if cursor:
+                if cursor in seen_cursors:
+                    log.warning("get_reward_markets_multi repeated cursor=%s; stopping pagination", cursor)
+                    break
+                seen_cursors.add(cursor)
+                params["next_cursor"] = cursor
+            try:
+                async with httpx.AsyncClient(timeout=20, trust_env=True) as http:
+                    resp = await http.get(
+                        "https://clob.polymarket.com/rewards/markets/multi",
+                        params=params,
+                    )
+                    resp.raise_for_status()
+                    payload = resp.json()
+            except Exception as e:
+                log.warning("get_reward_markets_multi page=%d cursor=%s: %s", page + 1, cursor or "-", e)
+                break
+
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, list):
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    condition_id = str(item.get("condition_id") or "")
+                    if condition_id and condition_id in seen_conditions:
+                        continue
+                    if condition_id:
+                        seen_conditions.add(condition_id)
+                    out.append(item)
+
+            next_cursor = str(payload.get("next_cursor") or "") if isinstance(payload, dict) else ""
+            if not next_cursor or next_cursor == "LTE=":
+                break
+            cursor = next_cursor
+        return out
 
     # ── Markets ────────────────────────────────────────────────────────────────
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import websockets
@@ -152,8 +153,50 @@ class UserWsWatcher:
                 matched or "?",
             )
 
-        if order_id and order_type == "CANCELLATION" and status in ("CANCELED", "CANCELLED"):
-            await db.update_position_status(order_id, "CANCELLED")
+        if not order_id:
+            return
+
+        original_size = _to_float(original)
+        matched_size = _to_float(matched) or 0.0
+        if matched_size > 0:
+            await db.update_position_matched_size(order_id, matched_size)
+
+        local_pos = await db.get_position(order_id)
+        local_side = str((local_pos or {}).get("side") or side or "").upper()
+        local_size = _to_float((local_pos or {}).get("size")) or original_size or 0.0
+        fully_matched = local_size > 0 and matched_size >= max(0.0, local_size - 0.0001)
+
+        if fully_matched or status in ("FILLED", "MATCHED"):
+            if local_side in ("BUY", "SELL"):
+                await db.update_position_status(
+                    order_id,
+                    "FILLED",
+                    filled_at=datetime.now(timezone.utc).isoformat(),
+                )
+                log.info("USER_WS filled side=%s id=%s matched=%s size=%s", local_side, _short(order_id), matched or "?", local_size)
+            return
+
+        if matched_size > 0:
+            log.info(
+                "USER_WS partial_fill side=%s id=%s matched=%s size=%s status=%s",
+                local_side or "?",
+                _short(order_id),
+                matched or "?",
+                local_size or "?",
+                status or "?",
+            )
+
+        if order_type == "CANCELLATION" and status in ("CANCELED", "CANCELLED"):
+            if matched_size > 0:
+                await db.update_position_status(order_id, "UNKNOWN")
+                log.warning(
+                    "USER_WS partial_cancel id=%s matched=%s size=%s marked UNKNOWN for manual reconcile",
+                    _short(order_id),
+                    matched or "?",
+                    local_size or "?",
+                )
+            else:
+                await db.update_position_status(order_id, "CANCELLED")
 
     def _log_trade(self, event: dict[str, Any]) -> None:
         trade_id = str(event.get("id") or event.get("taker_order_id") or "")
@@ -189,3 +232,12 @@ def _short(value: str, head: int = 10, tail: int = 6) -> str:
 
 def _clip(value: str, limit: int = 500) -> str:
     return value if len(value) <= limit else value[:limit] + "..."
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

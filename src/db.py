@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS positions (
     status         TEXT NOT NULL DEFAULT 'OPEN',
     placed_at      TEXT NOT NULL,
     filled_at      TEXT,
+    matched_size   REAL NOT NULL DEFAULT 0,
     reward_earned  REAL NOT NULL DEFAULT 0,
     parent_order_id TEXT,
     local_id       TEXT,
@@ -51,6 +52,7 @@ async def init_db() -> None:
         await _ensure_column(db, "positions", "parent_order_id", "TEXT")
         await _ensure_column(db, "positions", "local_id", "TEXT")
         await _ensure_column(db, "positions", "source", "TEXT NOT NULL DEFAULT 'BOT'")
+        await _ensure_column(db, "positions", "matched_size", "REAL NOT NULL DEFAULT 0")
         await db.execute(_CREATE_SETTINGS)
         await db.execute(_CREATE_BALANCE_SNAPSHOTS)
         await db.commit()
@@ -70,15 +72,16 @@ async def upsert_position(pos: dict) -> None:
         await db.execute(
             """INSERT INTO positions
                (order_id, condition_id, market_question, token_id, outcome, side,
-                price, size, status, placed_at, filled_at, reward_earned,
+                price, size, status, placed_at, filled_at, matched_size, reward_earned,
                 parent_order_id, local_id, source)
                VALUES (:order_id,:condition_id,:market_question,:token_id,:outcome,:side,
-                       :price,:size,:status,:placed_at,:filled_at,:reward_earned,
+                       :price,:size,:status,:placed_at,:filled_at,:matched_size,:reward_earned,
                        :parent_order_id,:local_id,:source)
                ON CONFLICT(order_id) DO UPDATE SET
                  outcome=excluded.outcome,
                  status=excluded.status,
                  filled_at=excluded.filled_at,
+                 matched_size=excluded.matched_size,
                  reward_earned=excluded.reward_earned,
                  parent_order_id=excluded.parent_order_id,
                  local_id=excluded.local_id,
@@ -95,6 +98,7 @@ async def upsert_position(pos: dict) -> None:
                 "status": pos.get("status", "OPEN"),
                 "placed_at": pos["placed_at"],
                 "filled_at": pos.get("filled_at"),
+                "matched_size": pos.get("matched_size", 0),
                 "reward_earned": pos.get("reward_earned", 0),
                 "parent_order_id": pos.get("parent_order_id"),
                 "local_id": pos.get("local_id"),
@@ -111,6 +115,23 @@ async def update_position_status(order_id: str, status: str, filled_at: str | No
             (status, filled_at, order_id),
         )
         await db.commit()
+
+
+async def update_position_matched_size(order_id: str, matched_size: float) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE positions SET matched_size=? WHERE order_id=?",
+            (matched_size, order_id),
+        )
+        await db.commit()
+
+
+async def get_position(order_id: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM positions WHERE order_id=?", (order_id,)) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
 
 
 async def replace_position_order_id(local_order_id: str, real_order_id: str, status: str = "OPEN") -> None:

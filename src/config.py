@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     max_slots: int = 4             # legacy: no longer used by the capital model
     max_slots_per_market: int = 2  # max worst orders cancelled in one rebalance
     scan_interval_s: int = 60
+    scanner_mode: str = "legacy"    # legacy | multi
     min_daily_reward: float = 7.0
     depth: str = "edge"            # edge | mid | first
     category_blacklist: list[str] = ["politics"]

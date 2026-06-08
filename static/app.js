@@ -90,8 +90,9 @@ function renderMarketsStatus(s) {
   const pool = s.pool_size ?? 0;
   const shown = s.shown ?? 0;
   const cursor = s.cursor ?? 0;
+  const mode = s.scanner_mode || 'legacy';
   const updated = s.last_updated ? new Date(s.last_updated).toLocaleTimeString('ru') : '—';
-  el.textContent = `Загружено reward-рынков: ${loaded}; прошли мин. награду: ${passing}; обработано в батче: ${batch}; прошло фильтры: ${scored}; в пуле: ${pool}; показано: ${shown}; курсор: ${cursor}; обновлено: ${updated}`;
+  el.textContent = `Режим: ${mode}; загружено reward-рынков: ${loaded}; прошли мин. награду: ${passing}; обработано в батче: ${batch}; прошло фильтры: ${scored}; в пуле: ${pool}; показано: ${shown}; курсор: ${cursor}; обновлено: ${updated}`;
 }
 
 function renderMarkets(markets) {
@@ -412,6 +413,7 @@ async function loadSettings() {
   if (data.max_slots_per_market != null) document.getElementById('s-max-slots-per-market').value = data.max_slots_per_market;
   if (data.min_daily_reward != null)     document.getElementById('s-min-reward').value = data.min_daily_reward;
   if (data.scan_interval_s != null)      document.getElementById('s-interval').value = data.scan_interval_s;
+  if (data.scanner_mode)                 document.getElementById('s-scanner-mode').value = data.scanner_mode;
   if (data.volatility_threshold != null) document.getElementById('s-volatility').value = data.volatility_threshold;
   if (data.min_spread != null)           document.getElementById('s-min-spread').value = data.min_spread;
   if (data.max_ob_spread != null)        document.getElementById('s-max-ob-spread').value = data.max_ob_spread;
@@ -440,6 +442,7 @@ async function saveSettings() {
     max_slots_per_market: parseInt(document.getElementById('s-max-slots-per-market').value),
     min_daily_reward:     parseFloat(document.getElementById('s-min-reward').value),
     scan_interval_s:      parseInt(document.getElementById('s-interval').value),
+    scanner_mode:         document.getElementById('s-scanner-mode').value,
     volatility_threshold: parseFloat(document.getElementById('s-volatility').value),
     min_spread:           parseFloat(document.getElementById('s-min-spread').value),
     max_ob_spread:        parseFloat(document.getElementById('s-max-ob-spread').value),
@@ -448,12 +451,17 @@ async function saveSettings() {
     monitor_interval_s:   parseInt(document.getElementById('s-monitor-interval').value),
     word_blacklist:       wordList,
   };
-  await fetch(`${API}/api/settings`, {
+  const response = await fetch(`${API}/api/settings`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
   const msg = document.getElementById('settings-msg');
+  if (!response.ok) {
+    msg.textContent = 'Ошибка сохранения';
+    return;
+  }
+  await loadSettings();
   msg.textContent = 'Сохранено ✓';
   setTimeout(() => msg.textContent = '', 2000);
 }
