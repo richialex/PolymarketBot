@@ -64,6 +64,7 @@ async def get_status():
         "total_earned": round(earned, 4),
         "errors": errors,
         "api_reachable": api_reachable,
+        "ws": await bot.ws_status(),
     }
 
 

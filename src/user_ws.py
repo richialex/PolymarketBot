@@ -24,6 +24,10 @@ log = configure_ws_file_logger("user_ws")
 class UserWsWatcher:
     def __init__(self) -> None:
         self._seen_events: set[tuple[str, str, str]] = set()
+        self._connected = False
+        self._subscribed_markets: set[str] = set()
+        self._last_message_at = 0.0
+        self._last_pong_at = 0.0
 
     async def run(self) -> None:
         backoff = 1
@@ -32,6 +36,7 @@ class UserWsWatcher:
                 markets = await self._active_markets()
                 if not markets:
                     log.info("USER_WS idle: no active markets")
+                    self._set_connection_state(False, set())
                     await asyncio.sleep(REFRESH_INTERVAL_S)
                     continue
                 await self._run_connection(markets)
@@ -54,6 +59,7 @@ class UserWsWatcher:
         log.info("USER_WS connecting markets=%d api_key=%s", len(subscribed), _short(safe_key))
 
         async with websockets.connect(USER_WS_URL, ping_interval=None) as ws:
+            self._set_connection_state(True, subscribed)
             await ws.send(json.dumps(sub))
             log.info("USER_WS subscribed initial markets=%d", len(subscribed))
 
@@ -66,6 +72,7 @@ class UserWsWatcher:
                 await asyncio.gather(*tasks)
             finally:
                 stop.set()
+                self._set_connection_state(False, set())
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
@@ -81,7 +88,9 @@ class UserWsWatcher:
         while not stop.is_set():
             msg = await ws.recv()
             if msg == "PONG":
+                self._mark_pong()
                 continue
+            self._mark_message()
             try:
                 event = json.loads(msg)
             except json.JSONDecodeError:
@@ -98,6 +107,7 @@ class UserWsWatcher:
             for market in sorted(active - subscribed):
                 await ws.send(json.dumps({"markets": [market], "operation": "subscribe"}))
                 subscribed.add(market)
+                self._set_subscribed_markets(subscribed)
                 pending_unsub.pop(market, None)
                 log.info("USER_WS subscribe market=%s total=%d", _short(market), len(subscribed))
 
@@ -111,6 +121,7 @@ class UserWsWatcher:
             for market in ready:
                 await ws.send(json.dumps({"markets": [market], "operation": "unsubscribe"}))
                 subscribed.discard(market)
+                self._set_subscribed_markets(subscribed)
                 pending_unsub.pop(market, None)
                 log.info("USER_WS unsubscribe market=%s total=%d", _short(market), len(subscribed))
 
@@ -119,6 +130,36 @@ class UserWsWatcher:
                 stop.set()
                 await ws.close()
                 return
+
+    def is_healthy(self) -> bool:
+        return self._connected and bool(self._subscribed_markets)
+
+    def status(self) -> dict[str, Any]:
+        now = time.monotonic()
+        return {
+            "connected": self._connected,
+            "subscribed_markets": len(self._subscribed_markets),
+            "last_message_age_s": round(now - self._last_message_at, 1) if self._last_message_at else None,
+            "last_pong_age_s": round(now - self._last_pong_at, 1) if self._last_pong_at else None,
+        }
+
+    def _set_connection_state(self, connected: bool, subscribed: set[str]) -> None:
+        self._connected = connected
+        self._subscribed_markets = set(subscribed)
+        if connected:
+            self._last_message_at = 0.0
+            self._last_pong_at = 0.0
+
+    def _set_subscribed_markets(self, subscribed: set[str]) -> None:
+        self._subscribed_markets = set(subscribed)
+
+    def _mark_message(self) -> None:
+        self._last_message_at = time.monotonic()
+
+    def _mark_pong(self) -> None:
+        now = time.monotonic()
+        self._last_pong_at = now
+        self._last_message_at = now
 
     async def _handle_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("event_type") or event.get("type") or "").lower()

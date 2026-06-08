@@ -32,6 +32,7 @@ POOL_MAX_SIZE    = 50    # best candidates kept in memory across ticks
 MONITOR_INTERVAL = 5   # seconds between position checks
 TRADE_INTERVAL = 10    # seconds between trade decisions when scanner runs separately
 ORDER_STATUS_REST_INTERVAL_S = 30
+ORDER_STATUS_REST_HEALTHY_WS_INTERVAL_S = 300
 
 
 class FarmingBot:
@@ -198,6 +199,12 @@ class FarmingBot:
             return order_book
         log.info("MARKET_WS fallback_rest purpose=%s token=%s", purpose, _short_id(token_id))
         return await client.get_order_book(token_id)
+
+    async def ws_status(self) -> dict:
+        return {
+            "market_ws": await self._market_ws.status(),
+            "user_ws": self._user_ws.status(),
+        }
 
     def _should_check_order_status(self, order_id: str, interval_s: int = ORDER_STATUS_REST_INTERVAL_S) -> bool:
         now = time.monotonic()
@@ -764,7 +771,12 @@ class FarmingBot:
         for pos in open_positions:
             order_id = pos["order_id"]
             status = ""
-            if self._should_check_order_status(order_id):
+            status_interval = (
+                ORDER_STATUS_REST_HEALTHY_WS_INTERVAL_S
+                if self._user_ws.is_healthy()
+                else ORDER_STATUS_REST_INTERVAL_S
+            )
+            if self._should_check_order_status(order_id, status_interval):
                 order = await client.get_order(order_id)
                 status = str(getattr(order, "status", "") or "").upper() if order else ""
 

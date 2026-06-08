@@ -56,6 +56,7 @@ class _BookState:
     last_trade_side: str = ""
     tick_size: str = ""
     resolved: bool = False
+    snapshot_epoch: int = 0
     last_price_change_log_at: float = 0.0
     logged_best_bid: float | None = None
     logged_best_ask: float | None = None
@@ -86,6 +87,14 @@ class MarketWsWatcher:
         self._fresh_ttl_s = fresh_ttl_s
         self._books: dict[str, _BookState] = {}
         self._lock = asyncio.Lock()
+        self._connected = False
+        self._connection_epoch = 0
+        self._connected_since = 0.0
+        self._last_message_at = 0.0
+        self._last_pong_at = 0.0
+        self._subscribed_assets: set[str] = set()
+        self._ws_book_hits = 0
+        self._rest_book_fallbacks = 0
 
     async def run(self) -> None:
         backoff = 1
@@ -94,6 +103,7 @@ class MarketWsWatcher:
                 assets = await self._active_assets()
                 if not assets:
                     log.info("MARKET_WS idle: no active assets")
+                    await self._set_connection_state(False, set())
                     await asyncio.sleep(REFRESH_INTERVAL_S)
                     continue
                 await self._run_connection(assets)
@@ -110,9 +120,12 @@ class MarketWsWatcher:
         async with self._lock:
             state = self._books.get(str(asset_id))
             if state is None or not state.has_snapshot or state.resolved:
+                self._rest_book_fallbacks += 1
                 return None
-            if require_fresh and not self._is_fresh_locked(state):
+            if require_fresh and not self._is_usable_locked(state):
+                self._rest_book_fallbacks += 1
                 return None
+            self._ws_book_hits += 1
             return state.as_order_book()
 
     async def get_best_bid_ask(self, asset_id: str, require_fresh: bool = True) -> tuple[float | None, float | None]:
@@ -120,14 +133,29 @@ class MarketWsWatcher:
             state = self._books.get(str(asset_id))
             if state is None or state.resolved:
                 return None, None
-            if require_fresh and not self._is_fresh_locked(state):
+            if require_fresh and not self._is_usable_locked(state):
                 return None, None
             return state.best_bid, state.best_ask
 
     async def is_fresh(self, asset_id: str) -> bool:
         async with self._lock:
             state = self._books.get(str(asset_id))
-            return bool(state and self._is_fresh_locked(state))
+            return bool(state and self._is_usable_locked(state))
+
+    async def status(self) -> dict[str, Any]:
+        async with self._lock:
+            now = time.monotonic()
+            usable_books = sum(1 for s in self._books.values() if self._is_usable_locked(s))
+            return {
+                "connected": self._connected,
+                "subscribed_assets": len(self._subscribed_assets),
+                "cached_books": len(self._books),
+                "usable_books": usable_books,
+                "ws_book_hits": self._ws_book_hits,
+                "rest_book_fallbacks": self._rest_book_fallbacks,
+                "last_message_age_s": round(now - self._last_message_at, 1) if self._last_message_at else None,
+                "last_pong_age_s": round(now - self._last_pong_at, 1) if self._last_pong_at else None,
+            }
 
     async def _run_connection(self, initial_assets: set[str]) -> None:
         subscribed = set(initial_assets)
@@ -138,6 +166,7 @@ class MarketWsWatcher:
         log.info("MARKET_WS connecting assets=%d", len(subscribed))
 
         async with websockets.connect(MARKET_WS_URL, ping_interval=None) as ws:
+            await self._set_connection_state(True, subscribed)
             await ws.send(json.dumps(sub))
             log.info("MARKET_WS subscribed initial assets=%d", len(subscribed))
 
@@ -150,6 +179,7 @@ class MarketWsWatcher:
                 await asyncio.gather(*tasks)
             finally:
                 stop.set()
+                await self._set_connection_state(False, set())
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
@@ -175,6 +205,7 @@ class MarketWsWatcher:
                     "custom_feature_enabled": True,
                 }))
                 subscribed.update(new_assets)
+                await self._set_subscribed_assets(subscribed)
                 for asset in new_assets:
                     pending_unsub.pop(asset, None)
                 log.info("MARKET_WS subscribe assets=%d total=%d", len(new_assets), len(subscribed))
@@ -192,6 +223,7 @@ class MarketWsWatcher:
                     subscribed.discard(asset)
                     pending_unsub.pop(asset, None)
                 await self._drop_assets(ready)
+                await self._set_subscribed_assets(subscribed)
                 log.info("MARKET_WS unsubscribe assets=%d total=%d", len(ready), len(subscribed))
 
             if not subscribed:
@@ -204,7 +236,9 @@ class MarketWsWatcher:
         while not stop.is_set():
             msg = await ws.recv()
             if msg == "PONG":
+                await self._mark_pong()
                 continue
+            await self._mark_message()
             try:
                 event = json.loads(msg)
             except json.JSONDecodeError:
@@ -254,6 +288,7 @@ class MarketWsWatcher:
             state.hash = str(event.get("hash") or "")
             state.updated_at = time.monotonic()
             state.has_snapshot = True
+            state.snapshot_epoch = self._connection_epoch
             state.event_count += 1
             self._refresh_top_locked(state)
             log.info(
@@ -389,6 +424,31 @@ class MarketWsWatcher:
         async with self._lock:
             for state in self._books.values():
                 state.updated_at = 0.0
+                state.snapshot_epoch = 0
+
+    async def _set_connection_state(self, connected: bool, subscribed: set[str]) -> None:
+        async with self._lock:
+            if connected:
+                self._connection_epoch += 1
+                self._connected_since = time.monotonic()
+                self._last_message_at = 0.0
+                self._last_pong_at = 0.0
+            self._connected = connected
+            self._subscribed_assets = set(subscribed)
+
+    async def _set_subscribed_assets(self, subscribed: set[str]) -> None:
+        async with self._lock:
+            self._subscribed_assets = set(subscribed)
+
+    async def _mark_message(self) -> None:
+        async with self._lock:
+            self._last_message_at = time.monotonic()
+
+    async def _mark_pong(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            self._last_pong_at = now
+            self._last_message_at = now
 
     def _state_locked(self, asset_id: str) -> _BookState:
         state = self._books.get(asset_id)
@@ -399,6 +459,15 @@ class MarketWsWatcher:
 
     def _is_fresh_locked(self, state: _BookState) -> bool:
         return state.updated_at > 0 and time.monotonic() - state.updated_at <= self._fresh_ttl_s
+
+    def _is_usable_locked(self, state: _BookState) -> bool:
+        if not state.has_snapshot or state.resolved:
+            return False
+        if not self._connected:
+            return False
+        if state.asset_id not in self._subscribed_assets:
+            return False
+        return state.snapshot_epoch == self._connection_epoch
 
     def _apply_price_level_locked(self, state: _BookState, change: dict[str, Any]) -> None:
         price = _to_float(change.get("price"))
