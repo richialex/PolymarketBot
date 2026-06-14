@@ -171,6 +171,11 @@ function renderPositions(positions) {
     const history = conditionHistory[p.condition_id] || [];
     const detailRow = expanded ? renderConditionHistoryRow(p, history) : '';
 
+    const actions = canCancel
+      ? `<button class="btn btn-danger btn-sm" onclick="cancelPosition('${p.order_id}')">Отмена</button>
+         <button class="btn btn-danger-ghost btn-sm" onclick="banPosition('${p.order_id}')">Бан</button>`
+      : `<button class="btn btn-danger-ghost btn-sm" onclick="banPosition('${p.order_id}')">Бан</button>`;
+
     return `<tr>
       <td class="q-cell" title="${esc(p.market_question)}">${esc(p.market_question)}</td>
       <td>${esc(p.outcome || '—')}</td>
@@ -180,7 +185,7 @@ function renderPositions(positions) {
       <td>$${fmt4(orderUsdc)}</td>
       <td><span class="chip ${chipClassFor(p.status)}">${esc(p.status)}</span></td>
       <td style="font-size:12px;color:var(--text-muted)">${placed}</td>
-      <td>${canCancel ? `<button class="btn btn-danger btn-sm" onclick="cancelPosition('${p.order_id}')">Отмена</button>` : '—'}</td>
+      <td><div class="action-buttons">${actions}</div></td>
       <td class="caret-cell"><button class="btn btn-ghost btn-caret" title="История по рынку" onclick="togglePositionHistory('${p.condition_id}', '${p.order_id}')">${expanded ? '▲' : '▼'}</button></td>
     </tr>${detailRow}`;
   }).join('');
@@ -219,6 +224,13 @@ async function cancelPosition(orderId) {
   if (!confirm('Отменить ордер?')) return;
   await del(`/api/positions/${orderId}`);
   await Promise.all([fetchPositions(), fetchManualOrders(), fetchUnmanagedPositions(), fetchStatus(), fetchStats()]);
+}
+
+async function banPosition(orderId) {
+  if (!confirm('Забанить рынок на 24 часа и отменить открытый ордер?')) return;
+  await post(`/api/positions/${orderId}/ban`);
+  await Promise.all([fetchMarkets(), fetchPositions(), fetchManualOrders(), fetchUnmanagedPositions(), fetchStatus(), fetchStats()]);
+  if (historyOpen) await fetchHistory();
 }
 
 function renderUnmanagedPositions(positions) {
@@ -418,6 +430,8 @@ async function loadSettings() {
   if (data.min_spread != null)           document.getElementById('s-min-spread').value = data.min_spread;
   if (data.max_ob_spread != null)        document.getElementById('s-max-ob-spread').value = data.max_ob_spread;
   if (data.max_bid_depth_spread != null) document.getElementById('s-max-bid-depth').value = data.max_bid_depth_spread;
+  if (data.max_target_level_share_pct != null) document.getElementById('s-max-level-share').value = data.max_target_level_share_pct;
+  if (data.target_level_share_confirm_s != null) document.getElementById('s-level-share-confirm').value = data.target_level_share_confirm_s;
   if (data.max_daily_trades != null)     document.getElementById('s-max-daily-trades').value = data.max_daily_trades;
   if (data.monitor_interval_s != null)   document.getElementById('s-monitor-interval').value = data.monitor_interval_s;
   if (data.word_blacklist != null)       document.getElementById('s-word-blacklist').value = (data.word_blacklist || []).join(', ');
@@ -447,6 +461,8 @@ async function saveSettings() {
     min_spread:           parseFloat(document.getElementById('s-min-spread').value),
     max_ob_spread:        parseFloat(document.getElementById('s-max-ob-spread').value),
     max_bid_depth_spread: parseFloat(document.getElementById('s-max-bid-depth').value),
+    max_target_level_share_pct: parseFloat(document.getElementById('s-max-level-share').value),
+    target_level_share_confirm_s: parseInt(document.getElementById('s-level-share-confirm').value),
     max_daily_trades:     parseInt(document.getElementById('s-max-daily-trades').value),
     monitor_interval_s:   parseInt(document.getElementById('s-monitor-interval').value),
     word_blacklist:       wordList,

@@ -197,24 +197,28 @@ async def enrich_batch(
                 token_mid = mid_from_order_book(ob) or float(t["price"])
                 top4_liq += _zone_liquidity_usd(ob, token_mid, max_spread)
 
-            # Hard filter: bid-ask spread too wide on the token we will actually BUY.
-            # We buy the expensive token (price > 0.50), so check its spread — not always YES.
-            expensive_idx = max(range(len(token_list)), key=lambda i: float(token_list[i]["price"]))
-            expensive_ob = all_obs[expensive_idx] if expensive_idx < len(all_obs) else all_obs[0] if all_obs else None
-            expensive_token_id = token_list[expensive_idx]["token_id"]
-            ob_spread = _ob_spread_cents(expensive_ob)
+            # Hard filters on the token we will actually BUY.
+            valid_buy_indexes = [
+                i for i, t in enumerate(token_list)
+                if 0 < float(t["price"]) < 1
+            ]
+            buy_idx = min(valid_buy_indexes or range(len(token_list)), key=lambda i: float(token_list[i]["price"]))
+            buy_ob = all_obs[buy_idx] if buy_idx < len(all_obs) else all_obs[0] if all_obs else None
+            buy_token_id = token_list[buy_idx]["token_id"]
+
+            ob_spread = _ob_spread_cents(buy_ob)
             if ob_spread is not None and ob_spread > max_ob_spread:
                 log.debug(
-                    "Skip %s: bid-ask spread %.1f¢ > max %.1f¢ (on expensive token)",
+                    "Skip %s: bid-ask spread %.1f¢ > max %.1f¢ (on buy token)",
                     question[:40], ob_spread, max_ob_spread,
                 )
                 continue
 
             # Hard filter: bid depth too thin on the token we will actually BUY.
-            depth_spread = bid_depth_spread_cents(all_bids_map.get(expensive_token_id, []))
+            depth_spread = bid_depth_spread_cents(all_bids_map.get(buy_token_id, []))
             if depth_spread is not None and depth_spread > max_bid_depth_spread:
                 log.debug(
-                    "Skip %s: bid depth spread %.1f¢ > max %.1f¢ (on expensive token)",
+                    "Skip %s: bid depth spread %.1f¢ > max %.1f¢ (on buy token)",
                     question[:40], depth_spread, max_bid_depth_spread,
                 )
                 continue
@@ -310,12 +314,12 @@ async def enrich_batch(
                 question[:40], daily, top4_liq, reward_per_dollar, trade_count, score,
             )
 
-            # Min order cost = expensive token × min_size (bot always buys the expensive side)
-            expensive_price = max(
+            # Min order cost for the token the bot will buy.
+            buy_price = min(
                 (float(t["price"]) for t in token_list if 0 < float(t["price"]) < 1),
                 default=mid_price,
             )
-            min_order_cost = round(min_size * expensive_price, 2)
+            min_order_cost = round(min_size * buy_price, 2)
 
             scored.append(ScoredMarket(
                 condition_id=reward.condition_id,

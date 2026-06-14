@@ -35,6 +35,7 @@
 - Added private Polymarket user WebSocket monitoring for bot order events.
 - Added dynamic user WebSocket subscriptions for active bot markets, with delayed unsubscribe.
 - Added safe WebSocket-driven local cancellation updates for `CANCELLATION/CANCELED` order events.
+- Added market ban actions so an active position or candidate market can be cancelled/hidden for 24 hours without immediately re-entering it.
 
 ### UI Improvements
 
@@ -46,11 +47,16 @@
 - Added collapsible history with pagination.
 - Added scan status text showing loaded reward markets, filtered markets, batch size, scored count, pool size, shown count, cursor, and update time.
 - Improved caret buttons for expandable rows/sections.
+- Added controls for target-level share protection and confirmation delay.
+- Added UI actions for banning a position's market and banning a market candidate.
 
 ### Scanner / Trading Logic
 
 - Fixed `/api/markets/refresh` crash caused by missing `max_slots` key.
 - Added buy-side bid depth filter (`max_bid_depth_spread`) so markets with fewer than 4 bid levels or a large gap between bid levels 1-4 on the token the bot will actually buy are skipped/cancelled as thin books.
+- Added target-price level share protection (`max_target_level_share_pct`) so the bot does not become too large a share of the exact bid level it quotes.
+- Added delayed confirmation for target-level share breaches before shrinking or cancelling an oversized live BUY.
+- Added cautious top-up logic when a live BUY level can fit more size under the configured max share.
 - Changed market candidate filtering to use fixed `order_usdc` budget.
 - Removed oversized "super-deal" multi-slot order sizing; one entry now uses one fixed position budget.
 - Kept rebalance behavior, but reinterpreted `max_slots_per_market` as max cancellations per rebalance instead of allowing larger order size.
@@ -59,6 +65,11 @@
   - bot capital limit is calculated from bot-managed exposure;
   - manual orders do not affect bot exposure.
 - Added a logging-only WebSocket probe for validating private user events and active-market order book streams.
+- Added active-position market WebSocket book cache with dynamic subscribe/unsubscribe and REST fallback for stale/missing books.
+- Changed active order monitoring to prefer fresh WebSocket books before REST order book reads.
+- Added fast WebSocket-triggered BUY step-down for `mid`/`edge` depth modes when an open order becomes the best bid.
+- Kept size changes, top-ups, exits, and SELL management in the regular monitor loop to avoid overreacting to noisy book flicker.
+- Split candidate handling into trade candidates and UI-shown candidates so the UI reflects the currently displayable market set without losing the scanner's larger internal pool.
 
 ### Data Model
 
@@ -66,11 +77,13 @@
 - Added active/history status grouping.
 - Added bot-managed capital exposure calculation.
 - Added balance snapshots for 24h chart/statistics.
+- Added `market_bans` table for temporary market-level exclusions.
 
 ### Future Work
 
 - Add global REST rate limiter and exponential backoff for `429`, `5xx`, and timeout responses.
 - Add WebSocket fill/trade handling after a real fill payload is observed.
 - Reduce REST polling after WebSocket fill handling is verified.
-- Add active-position market WebSocket book cache after REST/WS book parity is validated.
 - Add round-robin monitor mode for large position counts.
+- Add an operator/debug endpoint for inspecting cached WebSocket book depth and low-rate REST/WS parity samples.
+- Add smarter multi/gamma discovery so the scanner can cheaply prefilter a broad universe before expensive CLOB/history scoring.

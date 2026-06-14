@@ -86,6 +86,7 @@ class MarketWsWatcher:
     def __init__(self, fresh_ttl_s: float = FRESH_TTL_S) -> None:
         self._fresh_ttl_s = fresh_ttl_s
         self._books: dict[str, _BookState] = {}
+        self._changed_assets: asyncio.Queue[str] = asyncio.Queue(maxsize=1000)
         self._lock = asyncio.Lock()
         self._connected = False
         self._connection_epoch = 0
@@ -136,6 +137,9 @@ class MarketWsWatcher:
             if require_fresh and not self._is_usable_locked(state):
                 return None, None
             return state.best_bid, state.best_ask
+
+    async def next_changed_asset(self) -> str:
+        return await self._changed_assets.get()
 
     async def is_fresh(self, asset_id: str) -> bool:
         async with self._lock:
@@ -299,6 +303,7 @@ class MarketWsWatcher:
                 _fmt_optional(state.best_bid),
                 _fmt_optional(state.best_ask),
             )
+        self._notify_changed_assets({asset_id})
 
     async def _handle_price_change(self, event: dict[str, Any]) -> None:
         changes = event.get("price_changes") or []
@@ -335,6 +340,7 @@ class MarketWsWatcher:
                         _fmt_optional(state.best_ask),
                         len(changes),
                     )
+        self._notify_changed_assets(touched)
 
     async def _handle_best_bid_ask(self, event: dict[str, Any]) -> None:
         asset_id = str(event.get("asset_id") or "")
@@ -357,6 +363,7 @@ class MarketWsWatcher:
                 _fmt_optional(state.spread),
                 state.has_snapshot,
             )
+        self._notify_changed_assets({asset_id})
 
     async def _handle_last_trade_price(self, event: dict[str, Any]) -> None:
         asset_id = str(event.get("asset_id") or "")
@@ -495,6 +502,24 @@ class MarketWsWatcher:
         best_changed = state.best_bid != state.logged_best_bid or state.best_ask != state.logged_best_ask
         interval_elapsed = time.monotonic() - state.last_price_change_log_at >= PRICE_CHANGE_LOG_INTERVAL_S
         return best_changed or interval_elapsed
+
+    def _notify_changed_assets(self, asset_ids: set[str]) -> None:
+        for asset_id in asset_ids:
+            if not asset_id:
+                continue
+            try:
+                self._changed_assets.put_nowait(asset_id)
+            except asyncio.QueueFull:
+                # The bot still has the latest book cached; dropping an old wake-up
+                # is better than letting WS receive processing back up.
+                try:
+                    self._changed_assets.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    self._changed_assets.put_nowait(asset_id)
+                except asyncio.QueueFull:
+                    pass
 
 
 def _levels_to_map(levels: list[Any]) -> dict[float, float]:

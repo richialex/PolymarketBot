@@ -99,6 +99,14 @@
             Макс. глубина bid, ¢
             <input id="s-max-bid-depth" type="number" min="1" max="30" step="0.5" value="4" />
           </label>
+          <label title="Максимальная доля точного целевого bid-уровня, которую может занимать BUY-ордер бота. Если ордер больше — бот уменьшит размер">
+            Макс. доля уровня, %
+            <input id="s-max-level-share" type="number" min="0" max="99" step="1" value="50" />
+          </label>
+          <label title="Сколько секунд превышение доли уровня должно держаться перед уменьшением или отменой открытого BUY">
+            Подтверждение доли, сек
+            <input id="s-level-share-confirm" type="number" min="0" max="30" step="1" value="5" />
+          </label>
           <label title="Макс. изменений цены в день. Рынки активнее этого порога — не мёртвые, пропускаются">
             Макс. сделок в день
             <input id="s-max-daily-trades" type="number" min="0" max="50" step="1" value="3" />

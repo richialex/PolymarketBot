@@ -73,6 +73,7 @@ body { background: var(--bg); color: var(--text); font-family: var(--font); font
 .history-card .card-header { margin-bottom: 0; }
 .collapsible-panel { margin-top: 16px; }
 .action-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.action-buttons { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; }
 .pager { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 12px; color: var(--text-muted); font-size: 12px; }
 .history-detail td { background: #151823; }
 .history-detail .table-wrap { padding: 4px 0; }

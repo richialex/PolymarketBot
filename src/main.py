@@ -114,7 +114,7 @@ async def get_stats():
 
 @app.get("/api/markets")
 async def get_markets():
-    return [asdict(m) for m in bot.last_scan]
+    return [asdict(m) for m in bot.shown_markets]
 
 
 @app.get("/api/markets/status")
@@ -126,7 +126,7 @@ async def get_markets_status():
 async def refresh_markets():
     cfg_data = await bot._load_cfg()
     await bot.scan_once(cfg_data)
-    return {"count": len(bot.last_scan), **bot.scan_status}
+    return {"count": len(bot.shown_markets), **bot.scan_status}
 
 
 # ── Positions ──────────────────────────────────────────────────────────────────
@@ -286,6 +286,12 @@ class UnmanagedAction(BaseModel):
     token_id: str
 
 
+class MarketBanAction(BaseModel):
+    condition_id: str | None = None
+    market_question: str | None = None
+    hours: int | None = 24
+
+
 @app.post("/api/positions/unmanaged/take_control")
 async def take_control_unmanaged(body: UnmanagedAction):
     positions = await _unmanaged_positions()
@@ -326,6 +332,40 @@ async def cancel_position(order_id: str):
     if ok:
         await db.update_position_status(order_id, "CANCELLED")
     return {"ok": ok}
+
+
+@app.post("/api/positions/{order_id}/ban")
+async def ban_position_market(order_id: str):
+    pos = await db.get_position(order_id)
+    if pos is None:
+        raise HTTPException(status_code=404, detail="Position not found")
+
+    ok = True
+    if pos.get("status") in ("OPEN", "WARNING", "PENDING_PLACE", "SELL_OPEN", "SELL_PENDING"):
+        ok = await client.cancel_order(order_id)
+        if ok:
+            await db.update_position_status(order_id, "CANCELLED")
+
+    ban = await db.ban_market(
+        pos["condition_id"],
+        pos.get("market_question") or pos["condition_id"],
+        hours=24,
+    )
+    bot.forget_market(pos["condition_id"])
+    return {"ok": ok, "ban": ban}
+
+
+@app.post("/api/markets/ban")
+async def ban_market(body: MarketBanAction):
+    if not body.condition_id:
+        raise HTTPException(status_code=400, detail="condition_id is required")
+    ban = await db.ban_market(
+        body.condition_id,
+        body.market_question or body.condition_id,
+        hours=body.hours or 24,
+    )
+    bot.forget_market(body.condition_id)
+    return {"ok": True, "ban": ban}
 
 
 @app.delete("/api/orders/{order_id}")
@@ -384,7 +424,7 @@ async def stop_bot():
 async def manual_tick():
     """Trigger a single scan+place cycle immediately."""
     await bot.tick()
-    return {"markets_found": len(bot.last_scan)}
+    return {"markets_found": len(bot.shown_markets)}
 
 
 # ── Settings ───────────────────────────────────────────────────────────────────
@@ -404,6 +444,8 @@ class BotSettings(BaseModel):
     min_spread: float | None = None
     max_ob_spread: float | None = None
     max_bid_depth_spread: float | None = None
+    max_target_level_share_pct: float | None = None
+    target_level_share_confirm_s: int | None = None
     max_daily_trades: int | None = None
     monitor_interval_s: int | None = None
     max_order_usdc: float | None = None
@@ -432,6 +474,8 @@ async def get_settings():
         "min_spread":           cfg.min_spread,
         "max_ob_spread":        cfg.max_ob_spread,
         "max_bid_depth_spread": cfg.max_bid_depth_spread,
+        "max_target_level_share_pct": cfg.max_target_level_share_pct,
+        "target_level_share_confirm_s": cfg.target_level_share_confirm_s,
         "max_daily_trades":     cfg.max_daily_trades,
         "monitor_interval_s":   cfg.monitor_interval_s,
         "max_order_usdc":       cfg.max_order_usdc,
@@ -455,6 +499,10 @@ async def update_settings(body: BotSettings):
         data["bot_capital_limit_usdc"] = max(0.0, float(data["bot_capital_limit_usdc"]))
     if "free_balance_buffer_pct" in data:
         data["free_balance_buffer_pct"] = min(100.0, max(0.0, float(data["free_balance_buffer_pct"])))
+    if "max_target_level_share_pct" in data:
+        data["max_target_level_share_pct"] = min(99.0, max(0.0, float(data["max_target_level_share_pct"])))
+    if "target_level_share_confirm_s" in data:
+        data["target_level_share_confirm_s"] = max(0, int(data["target_level_share_confirm_s"]))
     for k, v in data.items():
         await db.set_setting(k, v)
     return data

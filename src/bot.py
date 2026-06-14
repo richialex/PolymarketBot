@@ -33,6 +33,8 @@ MONITOR_INTERVAL = 5   # seconds between position checks
 TRADE_INTERVAL = 10    # seconds between trade decisions when scanner runs separately
 ORDER_STATUS_REST_INTERVAL_S = 30
 ORDER_STATUS_REST_HEALTHY_WS_INTERVAL_S = 300
+FAST_STEP_DEBOUNCE_S = 0.75
+FAST_STEP_COOLDOWN_S = 6.0
 
 
 class FarmingBot:
@@ -41,15 +43,20 @@ class FarmingBot:
         self._scan_task: asyncio.Task | None = None
         self._trader_task: asyncio.Task | None = None
         self._monitor_task: asyncio.Task | None = None
+        self._fast_step_task: asyncio.Task | None = None
         self._user_ws_task: asyncio.Task | None = None
         self._market_ws_task: asyncio.Task | None = None
         self._user_ws = UserWsWatcher()
         self._market_ws = MarketWsWatcher()
         self.last_scan: list[ScoredMarket] = []
+        self.shown_markets: list[ScoredMarket] = []
         self.errors: list[str] = []
         self._last_depth: str | None = None
         self._scan_lock = asyncio.Lock()
         self._last_order_status_check: dict[str, float] = {}
+        self._level_share_breach_since: dict[str, float] = {}
+        self._fast_step_cooldown_until: dict[str, float] = {}
+        self._replacing_condition_ids: set[str] = set()
 
         # Rotating scanner state
         self._rewards_cache: list = []
@@ -79,21 +86,36 @@ class FarmingBot:
         self._scan_task = asyncio.create_task(self._scanner_loop())
         self._trader_task = asyncio.create_task(self._trader_loop())
         self._monitor_task = asyncio.create_task(self._monitor_loop())
+        self._fast_step_task = asyncio.create_task(self._fast_step_loop())
         self._user_ws_task = asyncio.create_task(self._user_ws.run())
         self._market_ws_task = asyncio.create_task(self._market_ws.run())
         log.info("FarmingBot started")
 
     def stop(self) -> None:
         self.running = False
-        for t in (self._scan_task, self._trader_task, self._monitor_task, self._user_ws_task, self._market_ws_task):
+        for t in (
+            self._scan_task,
+            self._trader_task,
+            self._monitor_task,
+            self._fast_step_task,
+            self._user_ws_task,
+            self._market_ws_task,
+        ):
             if t:
                 t.cancel()
         self._scan_task = None
         self._trader_task = None
         self._monitor_task = None
+        self._fast_step_task = None
         self._user_ws_task = None
         self._market_ws_task = None
         log.info("FarmingBot stopped")
+
+    def forget_market(self, condition_id: str) -> None:
+        """Drop a market from in-memory scanner state immediately."""
+        self._candidates_pool.pop(condition_id, None)
+        self.last_scan = [m for m in self.last_scan if m.condition_id != condition_id]
+        self.shown_markets = [m for m in self.shown_markets if m.condition_id != condition_id]
 
     async def reconcile(self) -> dict:
         """Reconcile local order journal with Polymarket open orders and holdings."""
@@ -264,6 +286,109 @@ class FarmingBot:
                 interval = MONITOR_INTERVAL
             await asyncio.sleep(interval)
 
+    async def _fast_step_loop(self) -> None:
+        """React quickly to WS book changes that make an open BUY the best bid.
+
+        This is intentionally narrower than the full monitor loop: it only steps
+        BUY orders down in mid/edge depth modes. Size changes, top-ups, exits, and SELL
+        handling stay in the regular monitor loop to avoid over-trading on noisy
+        book flicker.
+        """
+        pending: dict[str, float] = {}
+        while self.running:
+            try:
+                now = time.monotonic()
+                timeout = None
+                if pending:
+                    timeout = max(0.0, min(pending.values()) - now)
+
+                try:
+                    asset_id = await asyncio.wait_for(
+                        self._market_ws.next_changed_asset(),
+                        timeout=timeout,
+                    )
+                    cooldown_until = self._fast_step_cooldown_until.get(asset_id, 0.0)
+                    if time.monotonic() >= cooldown_until:
+                        pending[asset_id] = time.monotonic() + FAST_STEP_DEBOUNCE_S
+                except asyncio.TimeoutError:
+                    pass
+
+                now = time.monotonic()
+                due = [asset for asset, deadline in pending.items() if deadline <= now]
+                for asset_id in due:
+                    pending.pop(asset_id, None)
+                    await self._fast_step_down_asset(asset_id)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.exception("Fast step loop error: %s", e)
+                await asyncio.sleep(1)
+
+    async def _fast_step_down_asset(self, token_id: str) -> None:
+        cfg = await self._load_cfg()
+        depth = str(cfg.get("depth") or "").lower()
+        if depth == "first":
+            return
+
+        now = time.monotonic()
+        if now < self._fast_step_cooldown_until.get(token_id, 0.0):
+            return
+
+        positions = await db.get_open_positions()
+        pos = next(
+            (
+                p for p in positions
+                if str(p.get("token_id") or "") == str(token_id)
+                and str(p.get("side") or "").upper() == "BUY"
+            ),
+            None,
+        )
+        if pos is None:
+            self._fast_step_cooldown_until.pop(token_id, None)
+            return
+
+        condition_id = str(pos.get("condition_id") or "")
+        if condition_id in self._replacing_condition_ids:
+            return
+
+        order_book = await self._market_ws.get_order_book(token_id)
+        if order_book is None:
+            return
+
+        current_price = float(pos.get("price", 0) or 0)
+        live_bids = _extract_bids(order_book)
+        if len(live_bids) < 2:
+            return
+
+        levels = sorted(set(round(b, 3) for b in live_bids), reverse=True)
+        if len(levels) < 2:
+            return
+
+        best_bid = levels[0]
+        if abs(current_price - best_bid) >= 0.0005:
+            return
+
+        live_mid = mid_from_order_book(order_book)
+        market_info = self._candidates_pool.get(condition_id)
+        if market_info is None:
+            market_info = next((m for m in self.last_scan if m.condition_id == condition_id), None)
+        spread = market_info.rewards_max_spread if market_info else 0.04
+
+        second_level = levels[1]
+        lo = max(0.001, (live_mid or current_price) - spread)
+        if not (lo <= second_level < current_price):
+            return
+
+        log.info(
+            "FAST_STEP BUY %s front-of-queue %.2f¢ → %.2f¢ | %s",
+            pos["order_id"], current_price * 100, second_level * 100,
+            pos.get("market_question", "")[:45],
+        )
+        self._fast_step_cooldown_until[token_id] = time.monotonic() + FAST_STEP_COOLDOWN_S
+        replaced = await self._replace_open_order(pos, second_level, float(pos["size"]))
+        if not replaced:
+            self._fast_step_cooldown_until[token_id] = time.monotonic() + 1.0
+
     async def tick(self, cfg: dict | None = None) -> None:
         if cfg is None:
             cfg = await self._load_cfg()
@@ -275,10 +400,14 @@ class FarmingBot:
             cfg = await self._load_cfg()
 
         async with self._scan_lock:
-            candidates = await self._rotating_scan(cfg)
-            self.last_scan = candidates
-        log.info("Pool has %d candidates after scan", len(candidates))
-        return candidates
+            trade_candidates, shown_candidates = await self._rotating_scan(cfg)
+            self.last_scan = trade_candidates
+            self.shown_markets = shown_candidates
+        log.info(
+            "Pool has %d candidates after scan; UI shows %d",
+            len(trade_candidates), len(shown_candidates),
+        )
+        return shown_candidates
 
     async def trade_once(self, cfg: dict | None = None) -> None:
         if cfg is None:
@@ -314,8 +443,14 @@ class FarmingBot:
         await self._rebalance_risk(candidates, slots_remaining, order_usdc, max_slots_per_market)
 
         # 3. Re-fetch and enter new markets
-        open_positions = await db.get_open_positions()
-        open_condition_ids = {p["condition_id"] for p in open_positions}
+        active_positions = await db.get_active_positions()
+        open_condition_ids = {p["condition_id"] for p in active_positions} | set(self._replacing_condition_ids)
+        banned_conditions = set((await db.get_active_market_bans()).keys())
+        if banned_conditions:
+            self._candidates_pool = {
+                cid: m for cid, m in self._candidates_pool.items()
+                if cid not in banned_conditions
+            }
 
         # Recompute after potential rebalance
         bot_capital_in_use = await db.get_bot_capital_in_use()
@@ -337,6 +472,9 @@ class FarmingBot:
             if slots_remaining <= 0:
                 break
             if market.condition_id in open_condition_ids:
+                continue
+            if market.condition_id in banned_conditions:
+                self._candidates_pool.pop(market.condition_id, None)
                 continue
 
             ratio = market.score / avg_score if avg_score > 0 else 1.0
@@ -364,7 +502,7 @@ class FarmingBot:
                 "Entering '%s' budget=$%.2f score=%.4f (%.1f× avg)",
                 market.question[:40], market_budget, market.score, ratio,
             )
-            spent = await self._enter_market(market, market_budget, cfg["depth"])
+            spent = await self._enter_market(market, market_budget, cfg)
             if spent > 0:
                 free_order_cap = max(0.0, free_order_cap - spent)
                 capital_remaining = max(0.0, capital_remaining - spent)
@@ -373,7 +511,7 @@ class FarmingBot:
 
     # ── Rotating scanner ───────────────────────────────────────────────────────
 
-    async def _rotating_scan(self, cfg: dict) -> list[ScoredMarket]:
+    async def _rotating_scan(self, cfg: dict) -> tuple[list[ScoredMarket], list[ScoredMarket]]:
         """Cycle through ALL reward markets in batches, accumulating the best in a pool."""
         now = datetime.now(timezone.utc)
         min_daily = cfg["min_daily_reward"]
@@ -427,7 +565,8 @@ class FarmingBot:
                 "last_updated": now.isoformat(),
                 "scanner_mode": scanner_mode,
             })
-            return list(self._candidates_pool.values())
+            candidates = sorted(self._candidates_pool.values(), key=lambda m: m.score, reverse=True)
+            return candidates, candidates
 
         # Take next batch from cursor (wrap around)
         end = min(self._scan_cursor + SCAN_BATCH_SIZE, total)
@@ -454,8 +593,17 @@ class FarmingBot:
         )
 
         # Merge into pool: update existing + add new
+        banned_conditions = set((await db.get_active_market_bans()).keys())
         for m in new_markets:
+            if m.condition_id in banned_conditions:
+                continue
             self._candidates_pool[m.condition_id] = m
+
+        if banned_conditions:
+            self._candidates_pool = {
+                cid: m for cid, m in self._candidates_pool.items()
+                if cid not in banned_conditions
+            }
 
         # Apply user word blacklist — purge matching markets from pool in real-time
         word_bl = [w.strip().lower() for w in cfg.get("word_blacklist", []) if w.strip()]
@@ -489,7 +637,7 @@ class FarmingBot:
             "last_updated": datetime.now(timezone.utc).isoformat(),
             "scanner_mode": scanner_mode,
         })
-        return shown
+        return pool_sorted[:POOL_MAX_SIZE], shown
 
     # ── Risk rebalancing ───────────────────────────────────────────────────────
 
@@ -513,7 +661,8 @@ class FarmingBot:
         if not open_positions:
             return
 
-        entered_ids = {p["condition_id"] for p in open_positions}
+        active_positions = await db.get_active_positions()
+        entered_ids = {p["condition_id"] for p in active_positions} | set(self._replacing_condition_ids)
         candidate_map = {m.condition_id: m for m in candidates}
 
         unentered = [m for m in candidates if m.condition_id not in entered_ids]
@@ -628,7 +777,70 @@ class FarmingBot:
 
     # ── Enter a market ──────────────────────────────────────────────────────────
 
-    async def _enter_market(self, market: ScoredMarket, slot_budget: float, depth: str) -> float:
+    @staticmethod
+    def _book_level_usdc(order_book, side: str, price: float) -> float:
+        levels = getattr(order_book, "bids" if side.upper() == "BUY" else "asks", None) or []
+        total = 0.0
+        for level in levels:
+            try:
+                level_price = float(getattr(level, "price", 0) or 0)
+                level_size = float(getattr(level, "size", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if abs(level_price - price) <= 0.0005:
+                total += level_price * level_size
+        return total
+
+    @staticmethod
+    def _max_order_cost_for_level(existing_level_usdc: float, max_share_pct: float) -> float:
+        share = min(99.0, max(0.0, max_share_pct)) / 100.0
+        if share <= 0 or existing_level_usdc <= 0:
+            return 0.0
+        return existing_level_usdc * share / max(1e-9, 1.0 - share)
+
+    async def _replace_open_order(
+        self,
+        pos: dict,
+        price: float,
+        size: float,
+        side: str | None = None,
+    ) -> bool:
+        """Atomically guard a cancel/place replacement from the trader loop."""
+        condition_id = str(pos.get("condition_id", "") or "")
+        order_id = str(pos.get("order_id", "") or "")
+        if condition_id:
+            self._replacing_condition_ids.add(condition_id)
+        try:
+            cancelled = await client.cancel_order(order_id)
+            if not cancelled:
+                return False
+
+            await db.update_position_status(order_id, "CANCELLED")
+            resp = await client.place_limit(pos["token_id"], price, size, side or pos["side"])
+            if not resp:
+                return False
+
+            new_order_id = str(getattr(resp, "order_id", "") or getattr(resp, "id", ""))
+            if not new_order_id:
+                return False
+
+            await db.upsert_position({
+                **pos,
+                "order_id": new_order_id,
+                "price": price,
+                "size": float(size),
+                "side": side or pos["side"],
+                "status": "OPEN",
+                "placed_at": datetime.now(timezone.utc).isoformat(),
+                "filled_at": None,
+            })
+            self._last_order_status_check.pop(order_id, None)
+            return True
+        finally:
+            if condition_id:
+                self._replacing_condition_ids.discard(condition_id)
+
+    async def _enter_market(self, market: ScoredMarket, slot_budget: float, cfg: dict) -> float:
         """Place a single-sided BUY order on the more expensive token.
         Uses up to the fixed per-position budget.
         Returns total USDC spent."""
@@ -636,7 +848,12 @@ class FarmingBot:
         if not market.tokens:
             return 0.0
 
-        # Pick the more expensive token (price > 0.50) — more USDC locked per share
+        if await db.is_market_banned(market.condition_id):
+            log.info("Skip '%s': market is manually banned", market.question[:40])
+            self._candidates_pool.pop(market.condition_id, None)
+            return 0.0
+
+        # Pick the buy token used by the strategy.
         valid = [t for t in market.tokens if 0 < float(t["price"]) < 1]
         if not valid:
             valid = market.tokens
@@ -647,6 +864,7 @@ class FarmingBot:
         if not (0 < token_mid < 1):
             token_mid = market.mid_price
 
+        depth = cfg["depth"]
         bids = market.orderbook_bids.get(token_id, [])
         target_price = calc_order_price(token_mid, market.rewards_max_spread, depth, bids=bids)
 
@@ -654,6 +872,17 @@ class FarmingBot:
         # post_only orders get immediately cancelled if bid >= best_ask (taker).
         live_ob = await client.get_order_book(token_id)
         if live_ob is not None:
+            live_bids = _extract_bids(live_ob)
+            max_bid_depth = float(cfg.get("max_bid_depth_spread", 4.0))
+            depth_spread = bid_depth_spread_cents(live_bids)
+            if depth_spread is not None and depth_spread > max_bid_depth:
+                log.info(
+                    "Skip '%s': bid depth spread %.1f¢ > max %.1f¢ (on buy token)",
+                    market.question[:40], depth_spread, max_bid_depth,
+                )
+                self._candidates_pool.pop(market.condition_id, None)
+                return 0.0
+
             asks_raw = getattr(live_ob, "asks", None) or []
             ask_prices = sorted([float(a.price) for a in asks_raw if getattr(a, "price", None)])
             if ask_prices:
@@ -673,6 +902,24 @@ class FarmingBot:
                             market.question[:40], target_price, best_ask,
                         )
                         return 0.0
+
+        max_level_share = float(cfg.get("max_target_level_share_pct", 50.0) or 0)
+        if live_ob is not None and max_level_share > 0:
+            existing_level_usdc = self._book_level_usdc(live_ob, "BUY", target_price)
+            level_budget = self._max_order_cost_for_level(existing_level_usdc, max_level_share)
+            if level_budget <= 0:
+                log.info(
+                    "Skip '%s': no existing liquidity at target %.2f¢ for max %.1f%% level share",
+                    market.question[:40], target_price * 100, max_level_share,
+                )
+                return 0.0
+            if level_budget < slot_budget:
+                log.info(
+                    "Shrink BUY budget $%.2f → $%.2f: max %.1f%% of %.2f¢ level (existing=$%.2f) | %s",
+                    slot_budget, level_budget, max_level_share, target_price * 100,
+                    existing_level_usdc, market.question[:45],
+                )
+                slot_budget = level_budget
 
         # Size: use as many shares as the slot budget allows, at least min_size
         min_size = math.ceil(market.rewards_min_size)
@@ -763,7 +1010,7 @@ class FarmingBot:
         depth = cfg["depth"]
         depth_changed = self._last_depth is not None and depth != self._last_depth
         if depth_changed:
-            log.info("Depth changed %s → %s, forcing reposition of all open orders", self._last_depth, depth)
+            log.info("Depth changed %s → %s, re-evaluating open order prices", self._last_depth, depth)
         self._last_depth = depth
 
         candidate_map = {m.condition_id: m for m in self.last_scan}
@@ -822,26 +1069,23 @@ class FarmingBot:
 
             if status in ("CANCELLED", "CANCELED"):
                 await db.update_position_status(order_id, "CANCELLED")
+                self._level_share_breach_since.pop(order_id, None)
                 continue
 
             # Get live order book data (used by both BUY and SELL logic)
             order_book = await self._get_order_book_ws_first(pos["token_id"], "monitor")
             live_mid = mid_from_order_book(order_book)
 
-            # ── Check 1: spread widened beyond threshold → exit position ─────
+            # Bid/ask spread can flicker on quiet markets. Bid-depth thinning is
+            # riskier: if the buy-side book no longer passes the entry filter,
+            # leave the market instead of continuing to rebalance into it.
             ob_spread = _ob_spread_cents(order_book)
             max_ob_spread = float(cfg.get("max_ob_spread", 2.0))
             if ob_spread is not None and ob_spread > max_ob_spread:
-                log.info(
-                    "Cancel %s: spread %.1f¢ > max %.1f¢ (market degraded) | %s",
+                log.debug(
+                    "Hold %s: spread %.1f¢ > entry max %.1f¢ (liquidity flicker) | %s",
                     order_id, ob_spread, max_ob_spread, pos.get("market_question", "")[:45],
                 )
-                cancelled = await client.cancel_order(order_id)
-                if cancelled:
-                    await db.update_position_status(order_id, "CANCELLED")
-                    # Remove from pool so bot doesn't re-enter until next rescan
-                    self._candidates_pool.pop(pos["condition_id"], None)
-                continue
 
             if pos.get("side") != "SELL":
                 live_bids_for_depth = _extract_bids(order_book)
@@ -849,13 +1093,14 @@ class FarmingBot:
                 depth_spread = bid_depth_spread_cents(live_bids_for_depth)
                 if depth_spread is not None and depth_spread > max_bid_depth:
                     log.info(
-                        "Cancel %s: bid depth spread %.1f¢ > max %.1f¢ (thin book) | %s",
+                        "Cancel %s: bid depth spread %.1f¢ > max %.1f¢ | %s",
                         order_id, depth_spread, max_bid_depth, pos.get("market_question", "")[:45],
                     )
                     cancelled = await client.cancel_order(order_id)
                     if cancelled:
                         await db.update_position_status(order_id, "CANCELLED")
                         self._candidates_pool.pop(pos["condition_id"], None)
+                        self._level_share_breach_since.pop(order_id, None)
                     continue
 
             market_info = candidate_map.get(pos["condition_id"])
@@ -885,6 +1130,7 @@ class FarmingBot:
                     continue
 
             if pos.get("side") == "SELL":
+                self._level_share_breach_since.pop(order_id, None)
                 # ── SELL: stay first in ask queue (lowest ask in reward zone) ──
                 live_asks = _extract_asks(order_book)
                 sell_mid = live_mid or current_price
@@ -901,28 +1147,14 @@ class FarmingBot:
                         )
 
                 price_drift = abs(current_price - new_target) > 0.001
-                if price_drift or depth_changed:
+                if price_drift:
                     log.info(
                         "Sell %s reposition %.4f → %.4f (drift=%s, forced=%s) | %s",
                         order_id, current_price, new_target,
                         f"{abs(current_price - new_target):.4f}", depth_changed,
                         pos.get("market_question", "")[:45],
                     )
-                    cancelled = await client.cancel_order(order_id)
-                    if cancelled:
-                        await db.update_position_status(order_id, "CANCELLED")
-                        resp = await client.place_limit(pos["token_id"], new_target, pos["size"], "SELL")
-                        if resp:
-                            new_order_id = str(getattr(resp, "order_id", "") or getattr(resp, "id", ""))
-                            if new_order_id:
-                                await db.upsert_position({
-                                    **pos,
-                                    "order_id": new_order_id,
-                                    "price": new_target,
-                                    "status": "OPEN",
-                                    "placed_at": datetime.now(timezone.utc).isoformat(),
-                                    "filled_at": None,
-                                })
+                    await self._replace_open_order(pos, new_target, pos["size"], "SELL")
 
             else:
                 # ── BUY: existing bid-side logic ─────────────────────────────
@@ -955,28 +1187,114 @@ class FarmingBot:
                             new_target = second_level
 
                 price_drift = abs(current_price - new_target) > 0.001
+                max_level_share = float(cfg.get("max_target_level_share_pct", 50.0) or 0)
+                confirm_s = max(0.0, float(cfg.get("target_level_share_confirm_s", 5) or 0))
+                min_size = math.ceil(market_info.rewards_min_size) if market_info else 1
 
-                if price_drift or depth_changed:
+                if order_book is not None and max_level_share > 0 and not price_drift:
+                    level_usdc = self._book_level_usdc(order_book, "BUY", current_price)
+                    order_usdc = current_price * float(pos["size"])
+                    target_order_usdc = max(0.0, float(cfg.get("order_usdc", 0) or 0))
+                    if level_usdc + 0.01 >= order_usdc:
+                        external_level_usdc = max(0.0, level_usdc - order_usdc)
+                        total_after_usdc = level_usdc
+                    else:
+                        external_level_usdc = level_usdc
+                        total_after_usdc = level_usdc + order_usdc
+                    share_pct = (order_usdc / total_after_usdc * 100.0) if total_after_usdc > 0 else 100.0
+                    if share_pct > max_level_share:
+                        started = self._level_share_breach_since.setdefault(order_id, time.monotonic())
+                        elapsed = time.monotonic() - started
+                        if elapsed < confirm_s:
+                            log.debug(
+                                "Hold %s: level share %.1f%% > %.1f%% for %.1fs/%.0fs | %s",
+                                order_id, share_pct, max_level_share, elapsed, confirm_s,
+                                pos.get("market_question", "")[:45],
+                            )
+                            continue
+
+                        max_cost = self._max_order_cost_for_level(external_level_usdc, max_level_share)
+                        new_size = math.floor(max_cost / current_price) if current_price > 0 else 0
+
+                        if new_size >= min_size and new_size < float(pos["size"]):
+                            log.info(
+                                "Shrink BUY %s size %.0f → %.0f: level share %.1f%% > %.1f%% | %s",
+                                order_id, float(pos["size"]), new_size, share_pct, max_level_share,
+                                pos.get("market_question", "")[:45],
+                            )
+                            replaced = await self._replace_open_order(pos, current_price, new_size)
+                            if replaced:
+                                self._level_share_breach_since.pop(order_id, None)
+                            continue
+
+                        log.info(
+                            "Cancel BUY %s: level share %.1f%% > %.1f%% and allowed size %d < min %d | %s",
+                            order_id, share_pct, max_level_share, new_size, min_size,
+                            pos.get("market_question", "")[:45],
+                        )
+                        cancelled = await client.cancel_order(order_id)
+                        if cancelled:
+                            await db.update_position_status(order_id, "CANCELLED")
+                            self._level_share_breach_since.pop(order_id, None)
+                        continue
+
+                    self._level_share_breach_since.pop(order_id, None)
+
+                    max_cost = self._max_order_cost_for_level(external_level_usdc, max_level_share)
+                    if target_order_usdc > order_usdc + 1.0 and max_cost > order_usdc + 1.0:
+                        balance = await client.get_balance()
+                        free_balance = float(balance)
+                        buffer_pct = min(100.0, max(0.0, float(cfg.get("free_balance_buffer_pct", 10.0) or 0)))
+                        free_order_cap = max(0.0, free_balance * (1.0 - buffer_pct / 100.0))
+                        capital_limit = max(0.0, float(cfg.get("bot_capital_limit_usdc", 0) or 0))
+                        bot_capital_in_use = await db.get_bot_capital_in_use()
+                        capital_remaining = max(0.0, capital_limit - bot_capital_in_use)
+
+                        replacement_budget = min(
+                            target_order_usdc,
+                            max_cost,
+                            order_usdc + free_order_cap,
+                            order_usdc + capital_remaining,
+                        )
+                        new_size = math.floor(replacement_budget / current_price) if current_price > 0 else 0
+                        new_cost = new_size * current_price
+
+                        if new_size > float(pos["size"]) and new_cost > order_usdc + 1.0:
+                            log.info(
+                                "Top up BUY %s size %.0f → %.0f: level can fit $%.2f under %.1f%% share | %s",
+                                order_id, float(pos["size"]), new_size, new_cost, max_level_share,
+                                pos.get("market_question", "")[:45],
+                            )
+                            await self._replace_open_order(pos, current_price, new_size)
+                            continue
+
+                if price_drift:
+                    replace_size = float(pos["size"])
+                    if order_book is not None and max_level_share > 0:
+                        existing_level_usdc = self._book_level_usdc(order_book, "BUY", new_target)
+                        max_cost = self._max_order_cost_for_level(existing_level_usdc, max_level_share)
+                        capped_size = math.floor(max_cost / new_target) if new_target > 0 else 0
+                        if capped_size < min_size:
+                            log.info(
+                                "Cancel BUY %s: target %.2f¢ level cannot fit min size under %.1f%% share | %s",
+                                order_id, new_target * 100, max_level_share,
+                                pos.get("market_question", "")[:45],
+                            )
+                            cancelled = await client.cancel_order(order_id)
+                            if cancelled:
+                                await db.update_position_status(order_id, "CANCELLED")
+                                self._level_share_breach_since.pop(order_id, None)
+                            continue
+                        replace_size = min(replace_size, float(capped_size))
+
                     log.info(
-                        "Order %s reposition %.4f → %.4f (depth=%s, drift=%s, forced=%s)",
-                        order_id, current_price, new_target, depth,
-                        f"{abs(current_price - new_target):.4f}", depth_changed,
+                        "Order %s reposition %.4f → %.4f size %.0f → %.0f (depth=%s, drift=%s, forced=%s)",
+                        order_id, current_price, new_target, float(pos["size"]), replace_size,
+                        depth, f"{abs(current_price - new_target):.4f}", depth_changed,
                     )
-                    cancelled = await client.cancel_order(order_id)
-                    if cancelled:
-                        await db.update_position_status(order_id, "CANCELLED")
-                        resp = await client.place_limit(pos["token_id"], new_target, pos["size"], pos["side"])
-                        if resp:
-                            new_order_id = str(getattr(resp, "order_id", "") or getattr(resp, "id", ""))
-                            if new_order_id:
-                                await db.upsert_position({
-                                    **pos,
-                                    "order_id": new_order_id,
-                                    "price": new_target,
-                                    "status": "OPEN",
-                                    "placed_at": datetime.now(timezone.utc).isoformat(),
-                                    "filled_at": None,
-                                })
+                    replaced = await self._replace_open_order(pos, new_target, replace_size)
+                    if replaced:
+                        self._level_share_breach_since.pop(order_id, None)
 
     # ── Recover missing sell orders ─────────────────────────────────────────────
 
@@ -1063,6 +1381,8 @@ class FarmingBot:
             "max_ob_spread":       await db.get_setting("max_ob_spread",       s.max_ob_spread),
             "max_daily_trades":    await db.get_setting("max_daily_trades",    s.max_daily_trades),
             "max_bid_depth_spread": await db.get_setting("max_bid_depth_spread", s.max_bid_depth_spread),
+            "max_target_level_share_pct": await db.get_setting("max_target_level_share_pct", s.max_target_level_share_pct),
+            "target_level_share_confirm_s": await db.get_setting("target_level_share_confirm_s", s.target_level_share_confirm_s),
             "monitor_interval_s":  await db.get_setting("monitor_interval_s",  s.monitor_interval_s),
             "max_order_usdc":      await db.get_setting("max_order_usdc",      s.max_order_usdc),
             "max_positions":       await db.get_setting("max_positions",       s.max_positions),

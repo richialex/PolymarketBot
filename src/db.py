@@ -44,6 +44,15 @@ CREATE TABLE IF NOT EXISTS balance_snapshots (
 )
 """
 
+_CREATE_MARKET_BANS = """
+CREATE TABLE IF NOT EXISTS market_bans (
+    condition_id    TEXT PRIMARY KEY,
+    market_question TEXT NOT NULL DEFAULT '',
+    banned_at       TEXT NOT NULL,
+    expires_at      TEXT NOT NULL
+)
+"""
+
 
 async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -55,6 +64,7 @@ async def init_db() -> None:
         await _ensure_column(db, "positions", "matched_size", "REAL NOT NULL DEFAULT 0")
         await db.execute(_CREATE_SETTINGS)
         await db.execute(_CREATE_BALANCE_SNAPSHOTS)
+        await db.execute(_CREATE_MARKET_BANS)
         await db.commit()
 
 
@@ -254,6 +264,62 @@ async def delete_position(order_id: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM positions WHERE order_id=?", (order_id,))
         await db.commit()
+
+
+# ── Market bans ────────────────────────────────────────────────────────────────
+
+async def ban_market(condition_id: str, market_question: str = "", hours: int = 24) -> dict:
+    from datetime import datetime, timezone, timedelta
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(hours=max(1, int(hours)))
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO market_bans(condition_id, market_question, banned_at, expires_at)
+               VALUES(?,?,?,?)
+               ON CONFLICT(condition_id) DO UPDATE SET
+                 market_question=excluded.market_question,
+                 banned_at=excluded.banned_at,
+                 expires_at=excluded.expires_at""",
+            (condition_id, market_question or condition_id, now.isoformat(), expires_at.isoformat()),
+        )
+        await db.commit()
+    return {
+        "condition_id": condition_id,
+        "market_question": market_question or condition_id,
+        "banned_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
+    }
+
+
+async def prune_expired_market_bans() -> None:
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM market_bans WHERE expires_at <= ?", (now,))
+        await db.commit()
+
+
+async def get_active_market_bans() -> dict[str, dict]:
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("DELETE FROM market_bans WHERE expires_at <= ?", (now,))
+        async with db.execute(
+            "SELECT * FROM market_bans WHERE expires_at > ? ORDER BY expires_at DESC",
+            (now,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        await db.commit()
+        return {r["condition_id"]: dict(r) for r in rows}
+
+
+async def is_market_banned(condition_id: str) -> bool:
+    bans = await get_active_market_bans()
+    return condition_id in bans
 
 
 # ── Balance snapshots ─────────────────────────────────────────────────────────
