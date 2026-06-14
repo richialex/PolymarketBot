@@ -35,6 +35,8 @@
 - Added private Polymarket user WebSocket monitoring for bot order events.
 - Added dynamic user WebSocket subscriptions for active bot markets, with delayed unsubscribe.
 - Added safe WebSocket-driven local cancellation updates for `CANCELLATION/CANCELED` order events.
+- Added WebSocket fill handling for matched order updates, including matched-size tracking and local `FILLED` status updates.
+- Added WebSocket trade event logging after observing real `MATCHED`, `MINED`, and `CONFIRMED` payloads.
 - Added market ban actions so an active position or candidate market can be cancelled/hidden for 24 hours without immediately re-entering it.
 
 ### UI Improvements
@@ -82,7 +84,6 @@
 ### Future Work
 
 - Add global REST rate limiter and exponential backoff for `429`, `5xx`, and timeout responses.
-- Add WebSocket fill/trade handling after a real fill payload is observed.
 - Reduce REST polling after WebSocket fill handling is verified.
 - Add round-robin monitor mode for large position counts.
 - Add an operator/debug endpoint for inspecting cached WebSocket book depth and low-rate REST/WS parity samples.
