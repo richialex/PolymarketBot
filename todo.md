@@ -2,52 +2,50 @@
 
 ## Runtime Architecture Notes
 
-- `user_ws` is for fast private events about the bot's own orders.
-- `market_ws` is for fast order book movement on active bot markets.
-- REST stays in the system for commands, scanning, startup recovery, balances, and safety reconciliation.
-
-REST cannot be removed because order placement/cancellation, startup recovery, balance checks, scans, and fallback reconciliation still need request/response APIs.
+- `user_ws` is used for fast private events about the bot's own orders.
+- `market_ws` is used for fast order book movement on active bot markets.
+- REST remains required for order placement/cancellation, scanning, startup recovery, balances, and safety reconciliation.
+- Current order management prefers fresh WebSocket books for active positions and falls back to REST when WS data is stale or missing.
 
 ## User WS: Remaining Work
 
-1. Observe real `trade` / fill payloads in `logs/ws-YYYY-MM-DD.log`.
-2. Add explicit handling for failed/rejected WS trade/order statuses once real payloads are known.
-3. Keep SELL creation centralized through `_recover_missing_sells()` so REST monitor and WS cannot create duplicate SELL orders for the same filled BUY.
-4. Keep REST reconcile after startup/reconnect/missed events.
-5. Reduce REST `get_order()` polling further only after WS fill payloads are verified in production logs.
+1. Add explicit handling for failed/rejected WS trade/order statuses once real payloads are observed.
+2. Keep SELL creation centralized through `_recover_missing_sells()` so REST monitor and WS cannot create duplicate SELL orders for the same filled BUY.
+3. Keep REST reconcile after startup, reconnect, and missed events.
+4. Further reduce REST `get_order()` polling now that matched order updates and trade payloads have been observed in production logs.
 
 ## Market WS: Remaining Work
 
 1. Add an operator/debug endpoint or command to inspect live cached book depth for a token.
 2. Add optional low-rate WS-vs-REST parity sampling for diagnostics.
 3. Keep REST fallback for stale/missing WS books, reconnects, placement/cancellation, startup recovery, balances, and safety reconciliation.
+4. Continue observing `FAST_STEP` behavior in production to confirm it catches front-of-queue BUY drift before the regular monitor cycle.
 
 ## Order Size Liquidity Filter
 
-Add a filter so the bot does not become too large a share of the book liquidity at the place where it wants to quote.
+Implemented:
 
-Design options to choose from:
+- Target-price level share protection via `max_target_level_share_pct`.
+- Confirmation delay via `target_level_share_confirm_s`.
+- Shrink/cancel behavior when a live BUY exceeds the configured target-level share.
+- Cautious top-up behavior when an existing level can fit more size under the configured share.
 
-1. Target price level only:
-   - compare order USDC against existing liquidity at the exact target price.
-2. Reward-zone liquidity:
+Remaining ideas:
+
+1. Reward-zone liquidity:
    - compare order USDC against total liquidity inside the active reward zone.
-3. Top-N nearby levels:
+2. Top-N nearby levels:
    - compare order USDC against liquidity across the nearest N levels around target price.
-4. Combined rule:
+3. Combined rule:
    - apply the strictest limit from target level, reward zone, and top-N levels.
-
-Open questions:
-
-- What max share should be allowed, for example 50%.
-- Whether the filter should shrink the order or skip the market if the allowed size is below Polymarket minimum.
-- Whether the same rule should apply differently for BUY entry orders and SELL recovery orders.
+4. Decide whether SELL recovery orders need a separate share/liquidity rule.
 
 ## REST Hardening
 
 1. Add global REST rate limiting.
 2. Add exponential backoff for `429`, `5xx`, timeouts, and transient connection errors.
-3. Add round-robin monitor mode for large active position counts.
+3. Further reduce non-critical REST polling now that user/order WebSocket handling is proven.
+4. Add round-robin monitor mode for large active position counts.
 
 ## Scanner / Multi Smart Discovery
 
@@ -88,3 +86,24 @@ Build a smarter discovery layer instead of scanning Multi sequentially by reward
    - reasons for most skips;
    - elapsed time per stage.
 7. Keep Legacy as the fallback mode until the smart scanner consistently finds candidates at least as well as Legacy.
+
+## Upstream Changes To Evaluate
+
+Upstream `ggRonin/PolymarketBot` added commit `d73fb76` with several small scanner/trading changes. Do not merge blindly; port the useful pieces into the refactored architecture.
+
+1. Add configurable minimum days to expiry:
+   - upstream exposes `min_days_to_expiry`;
+   - current refactor still has `30` days hardcoded in `scanner.enrich_batch()`;
+   - useful and low risk to port.
+2. Fix `edge` depth price improvement:
+   - upstream disables second-level order-book improvement when `depth == "edge"`;
+   - current refactor still lets edge mode move inward to the second bid level;
+   - useful if edge mode should truly stay near the outer reward-zone edge.
+3. Add live spread check immediately before entry:
+   - upstream checks live `max_ob_spread` before placing;
+   - current refactor already checks live bid depth, best ask crossing, and target-level share before entry, but does not re-check live bid/ask spread at placement time;
+   - useful minor safety port.
+4. Revisit buy-token selection:
+   - upstream switched from cheaper token to more expensive token after observing fewer fills in practice;
+   - current refactor still buys the cheaper valid token;
+   - this changes exposure and min-size economics, so prefer making it configurable or testing before changing the default.

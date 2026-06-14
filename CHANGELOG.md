@@ -84,7 +84,7 @@
 ### Future Work
 
 - Add global REST rate limiter and exponential backoff for `429`, `5xx`, and timeout responses.
-- Reduce REST polling after WebSocket fill handling is verified.
+- Further reduce REST polling now that WebSocket fill handling is verified.
 - Add round-robin monitor mode for large position counts.
 - Add an operator/debug endpoint for inspecting cached WebSocket book depth and low-rate REST/WS parity samples.
 - Add smarter multi/gamma discovery so the scanner can cheaply prefilter a broad universe before expensive CLOB/history scoring.
