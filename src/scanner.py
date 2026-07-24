@@ -419,7 +419,7 @@ def calc_order_price(
       mid   → spread/2 from mid
       first → 1¢ from mid (top of zone, max reward share)
 
-    Order-book improvement: if the 2nd distinct bid level in the book is
+    Order-book improvement (edge and mid only): if the 2nd distinct bid level in the book is
     higher than the formula price AND still within the reward zone, we place
     there instead — higher in the queue, more rewards, but not the #1 bidder.
     """
@@ -432,6 +432,12 @@ def calc_order_price(
         offset = max(rewards_max_spread - one_cent, one_cent)
 
     formula_price = max(0.001, min(0.999, round(mid_price - offset, 3)))
+
+    # The "first" mode is handled by the bot against a live order book: it
+    # joins the existing best bid. Do not apply the edge/mid second-level
+    # shortcut here.
+    if depth == "first":
+        return formula_price
 
     if bids and len(bids) >= 2:
         # Deduplicate to get distinct price levels (0.1¢ precision), then pick 2nd highest

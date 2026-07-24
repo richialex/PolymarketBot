@@ -27,12 +27,15 @@ log = logging.getLogger(__name__)
 SCAN_BATCH_SIZE  = 100   # markets enriched per tick
 REWARDS_CACHE_TTL = 1800  # seconds before refreshing full rewards list
 POOL_MAX_SIZE    = 50    # best candidates kept in memory across ticks
+ACTIVE_REWARD_CHECK_INTERVAL_S = 120
+ACTIVE_REWARD_CHECK_DELAY_S = 0.25
 
 
 MONITOR_INTERVAL = 5   # seconds between position checks
 TRADE_INTERVAL = 10    # seconds between trade decisions when scanner runs separately
 ORDER_STATUS_REST_INTERVAL_S = 30
 ORDER_STATUS_REST_HEALTHY_WS_INTERVAL_S = 300
+AUTO_RECONCILE_INTERVAL_S = 20
 FAST_STEP_DEBOUNCE_S = 0.75
 FAST_STEP_COOLDOWN_S = 6.0
 
@@ -54,9 +57,16 @@ class FarmingBot:
         self._last_depth: str | None = None
         self._scan_lock = asyncio.Lock()
         self._last_order_status_check: dict[str, float] = {}
+        self._last_reconcile_at: float = 0.0
         self._level_share_breach_since: dict[str, float] = {}
         self._fast_step_cooldown_until: dict[str, float] = {}
         self._replacing_condition_ids: set[str] = set()
+
+        # Front-run protection state
+        self._fr_prev_size: dict[str, float] = {}        # token → previous best bid size (shares)
+        self._fr_prev_time: dict[str, float] = {}        # token → previous timestamp
+        self._fr_cooldown_until: dict[str, float] = {}   # token → cooldown expiry
+        self._last_active_reward_check_at: float = 0.0
 
         # Rotating scanner state
         self._rewards_cache: list = []
@@ -178,6 +188,7 @@ class FarmingBot:
                 marked_unknown += 1
 
         await self._recover_missing_sells()
+        self._last_reconcile_at = time.monotonic()
         return {
             "checked": len(local_positions),
             "open_orders": len(open_orders),
@@ -277,6 +288,13 @@ class FarmingBot:
         while self.running:
             try:
                 cfg = await self._load_cfg()
+                # The user WS can stay connected while dropping an individual
+                # order update. Reconcile is the authoritative fallback: it
+                # removes locally OPEN orders that no longer exist remotely.
+                if time.monotonic() - self._last_reconcile_at >= AUTO_RECONCILE_INTERVAL_S:
+                    result = await self.reconcile()
+                    if result["marked_filled"] or result["marked_cancelled"] or result["marked_unknown"]:
+                        log.info("Auto reconcile: %s", result)
                 await self._monitor_positions(cfg)
                 interval = int(cfg.get("monitor_interval_s", MONITOR_INTERVAL))
             except asyncio.CancelledError:
@@ -317,12 +335,108 @@ class FarmingBot:
                 due = [asset for asset, deadline in pending.items() if deadline <= now]
                 for asset_id in due:
                     pending.pop(asset_id, None)
+                    await self._check_front_run(asset_id)
                     await self._fast_step_down_asset(asset_id)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 log.exception("Fast step loop error: %s", e)
                 await asyncio.sleep(1)
+
+    async def _check_front_run(self, token_id: str) -> None:
+        """Cancel BUY if thin level ahead is being eaten rapidly."""
+        cfg = await self._load_cfg()
+        if not cfg.get("front_run_protection", True):
+            return
+
+        now = time.monotonic()
+        if now < self._fr_cooldown_until.get(token_id, 0.0):
+            return
+
+        positions = await db.get_open_positions()
+        pos = next(
+            (
+                p for p in positions
+                if str(p.get("token_id") or "") == str(token_id)
+                and str(p.get("side") or "").upper() == "BUY"
+            ),
+            None,
+        )
+        if pos is None:
+            self._fr_prev_size.pop(token_id, None)
+            self._fr_prev_time.pop(token_id, None)
+            return
+
+        order_book = await self._market_ws.get_order_book(token_id)
+        if order_book is None:
+            return
+
+        current_price = float(pos.get("price", 0) or 0)
+        live_bids = _extract_bids(order_book)
+        if not live_bids:
+            return
+
+        levels = sorted(set(round(b, 3) for b in live_bids), reverse=True)
+        best_bid = levels[0]
+
+        # If we ARE the best bid, the existing step-down logic handles it
+        if abs(current_price - best_bid) < 0.0005:
+            return
+
+        # Get best bid size in USD
+        best_bid_usd = 0.0
+        for level in (getattr(order_book, "bids", None) or []):
+            try:
+                lv_price = float(getattr(level, "price", 0) or 0)
+                lv_size = float(getattr(level, "size", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if abs(lv_price - best_bid) <= 0.0005:
+                best_bid_usd += lv_price * lv_size
+
+        threshold = float(cfg.get("front_run_bid_threshold_usd", 15.0) or 15.0)
+        if best_bid_usd >= threshold:
+            # Level ahead is thick — no protection needed, reset tracking
+            self._fr_prev_size.pop(token_id, None)
+            self._fr_prev_time.pop(token_id, None)
+            return
+
+        # Track consumption
+        prev_size = self._fr_prev_size.get(token_id)
+        prev_time = self._fr_prev_time.get(token_id)
+        self._fr_prev_size[token_id] = best_bid_usd
+        self._fr_prev_time[token_id] = now
+
+        if prev_size is None or prev_time is None or prev_size <= 0:
+            return
+
+        elapsed = now - prev_time
+        if elapsed <= 0:
+            return
+
+        consumed = prev_size - best_bid_usd
+        if consumed <= 0:
+            return
+
+        eat_pct = float(cfg.get("front_run_eat_pct", 30.0) or 30.0)
+        window_s = float(cfg.get("front_run_window_s", 3.0) or 3.0)
+        rate_per_s = (consumed / prev_size) / elapsed
+        threshold_rate = (eat_pct / 100.0) / window_s
+
+        if rate_per_s >= threshold_rate:
+            cooldown_s = float(cfg.get("front_run_cooldown_s", 15.0) or 15.0)
+            log.info(
+                "FRONT_RUN Cancel BUY %s: best bid $%.2f being eaten (%.0f%%/s ≥ %.0f%%/%.0fs threshold) | %s",
+                pos["order_id"], best_bid_usd, rate_per_s * 100, eat_pct, window_s,
+                pos.get("market_question", "")[:45],
+            )
+            cancelled = await client.cancel_order(pos["order_id"])
+            if cancelled:
+                await db.update_position_status(pos["order_id"], "CANCELLED")
+                self._candidates_pool.pop(pos.get("condition_id"), None)
+            self._fr_cooldown_until[token_id] = time.monotonic() + cooldown_s
+            self._fr_prev_size.pop(token_id, None)
+            self._fr_prev_time.pop(token_id, None)
 
     async def _fast_step_down_asset(self, token_id: str) -> None:
         cfg = await self._load_cfg()
@@ -412,6 +526,8 @@ class FarmingBot:
     async def trade_once(self, cfg: dict | None = None) -> None:
         if cfg is None:
             cfg = await self._load_cfg()
+
+        await self._check_active_position_rewards(cfg)
 
         candidates = list(self.last_scan)
         if not candidates:
@@ -542,6 +658,19 @@ class FarmingBot:
                 r for r in all_rewards
                 if float(getattr(r, "total_daily_rate", 0) or 0) >= min_daily
             ]
+            before_pool = len(self._candidates_pool)
+            pruned_pool = 0
+            if all_rewards:
+                passing_ids = {str(getattr(r, "condition_id", "") or "") for r in self._rewards_cache}
+                self._candidates_pool = {
+                    cid: m for cid, m in self._candidates_pool.items()
+                    if cid in passing_ids
+                }
+                self.last_scan = [m for m in self.last_scan if m.condition_id in passing_ids]
+                self.shown_markets = [m for m in self.shown_markets if m.condition_id in passing_ids]
+                pruned_pool = before_pool - len(self._candidates_pool)
+            else:
+                log.warning("Rewards refresh returned no markets; preserving existing candidate pool")
             self._rewards_cache_time = now
             self._rewards_cache_min_daily = min_daily
             self._rewards_cache_scanner_mode = scanner_mode
@@ -553,6 +682,8 @@ class FarmingBot:
                 "scanner_mode": scanner_mode,
             })
             log.info("Rewards cache refreshed mode=%s: %d markets pass min_daily>=%.1f", scanner_mode, len(self._rewards_cache), min_daily)
+            if pruned_pool:
+                log.info("Pruned %d stale candidate(s) below min_daily from pool", pruned_pool)
 
         total = len(self._rewards_cache)
         if total == 0:
@@ -775,6 +906,79 @@ class FarmingBot:
                 if cancelled:
                     await db.update_position_status(order_id, "CANCELLED")
 
+    async def _check_active_position_rewards(self, cfg: dict) -> None:
+        """Poll reward rates for open BUY orders and exit markets below min_daily."""
+        now = time.monotonic()
+        if now - self._last_active_reward_check_at < ACTIVE_REWARD_CHECK_INTERVAL_S:
+            return
+        self._last_active_reward_check_at = now
+
+        min_daily = float(cfg.get("min_daily_reward", 7.0) or 0)
+        if min_daily <= 0:
+            return
+
+        open_positions = await db.get_open_positions()
+        positions_by_cid: dict[str, list[dict]] = {}
+        for pos in open_positions:
+            if str(pos.get("side") or "").upper() == "SELL":
+                continue
+            cid = str(pos.get("condition_id") or "")
+            if cid:
+                positions_by_cid.setdefault(cid, []).append(pos)
+        if not positions_by_cid:
+            return
+
+        for index, (cid, positions) in enumerate(positions_by_cid.items()):
+            if index:
+                await asyncio.sleep(ACTIVE_REWARD_CHECK_DELAY_S)
+
+            market_reward = await client.get_market_reward(cid)
+            if market_reward is None:
+                log.warning(
+                    "Active reward check skipped %s: reward API returned no data | %s",
+                    _short_id(cid), positions[0].get("market_question", "")[:50],
+                )
+                continue
+
+            current_rate = self._daily_reward_rate(market_reward)
+            if current_rate is None:
+                log.warning(
+                    "Active reward check skipped %s: no rate_per_day in reward config | %s",
+                    _short_id(cid), positions[0].get("market_question", "")[:50],
+                )
+                continue
+
+            if current_rate >= min_daily:
+                continue
+
+            reason = f"reward dropped to ${current_rate:.2f}/day (min ${min_daily:.2f})"
+            log.info(
+                "Active reward exit %s: %s | %d open order(s) | %s",
+                _short_id(cid), reason, len(positions), positions[0].get("market_question", "")[:50],
+            )
+            self.forget_market(cid)
+            for pos in positions:
+                order_id = str(pos.get("order_id") or "")
+                if not order_id:
+                    continue
+                cancelled = await client.cancel_order(order_id)
+                if cancelled:
+                    await db.update_position_status(order_id, "CANCELLED")
+                    self._level_share_breach_since.pop(order_id, None)
+
+    @staticmethod
+    def _daily_reward_rate(market_reward: object) -> float | None:
+        configs = getattr(market_reward, "rewards_config", None) or []
+        total = 0.0
+        found = False
+        for item in configs:
+            try:
+                total += float(getattr(item, "rate_per_day", 0) or 0)
+                found = True
+            except (TypeError, ValueError):
+                continue
+        return total if found else None
+
     # ── Enter a market ──────────────────────────────────────────────────────────
 
     @staticmethod
@@ -797,6 +1001,24 @@ class FarmingBot:
         if share <= 0 or existing_level_usdc <= 0:
             return 0.0
         return existing_level_usdc * share / max(1e-9, 1.0 - share)
+
+    @staticmethod
+    def _first_position_price(
+        mid_price: float,
+        rewards_max_spread: float,
+        bids: list[float],
+    ) -> float:
+        """Return the existing best bid inside the reward zone for ``first`` mode."""
+        fallback = calc_order_price(mid_price, rewards_max_spread, "first")
+        levels = sorted(set(round(float(price), 3) for price in bids if price), reverse=True)
+        if not levels:
+            return fallback
+
+        best_bid = levels[0]
+        reward_floor = max(0.001, mid_price - rewards_max_spread)
+        if not reward_floor <= best_bid <= mid_price:
+            return fallback
+        return best_bid
 
     async def _replace_open_order(
         self,
@@ -873,6 +1095,7 @@ class FarmingBot:
         live_ob = await client.get_order_book(token_id)
         if live_ob is not None:
             live_bids = _extract_bids(live_ob)
+            live_asks = _extract_asks(live_ob)
             max_bid_depth = float(cfg.get("max_bid_depth_spread", 4.0))
             depth_spread = bid_depth_spread_cents(live_bids)
             if depth_spread is not None and depth_spread > max_bid_depth:
@@ -883,8 +1106,12 @@ class FarmingBot:
                 self._candidates_pool.pop(market.condition_id, None)
                 return 0.0
 
-            asks_raw = getattr(live_ob, "asks", None) or []
-            ask_prices = sorted([float(a.price) for a in asks_raw if getattr(a, "price", None)])
+            if depth == "first":
+                target_price = self._first_position_price(
+                    token_mid, market.rewards_max_spread, live_bids,
+                )
+
+            ask_prices = live_asks
             if ask_prices:
                 best_ask = round(ask_prices[0], 2)
                 if target_price >= best_ask:
@@ -903,8 +1130,9 @@ class FarmingBot:
                         )
                         return 0.0
 
+        max_level_share_enabled = bool(cfg.get("target_level_share_enabled", True))
         max_level_share = float(cfg.get("max_target_level_share_pct", 50.0) or 0)
-        if live_ob is not None and max_level_share > 0:
+        if live_ob is not None and max_level_share_enabled and max_level_share > 0:
             existing_level_usdc = self._book_level_usdc(live_ob, "BUY", target_price)
             level_budget = self._max_order_cost_for_level(existing_level_usdc, max_level_share)
             if level_budget <= 0:
@@ -995,7 +1223,7 @@ class FarmingBot:
 
     async def _monitor_positions(self, cfg: dict) -> None:
         # Recover any FILLED BUY positions whose SELL was never placed or was cancelled
-        await self._recover_missing_sells()
+        await self._recover_missing_sells(cfg)
 
         open_positions = await db.get_open_positions()
         if not open_positions:
@@ -1028,43 +1256,18 @@ class FarmingBot:
                 status = str(getattr(order, "status", "") or "").upper() if order else ""
 
             if status in ("FILLED", "MATCHED"):
-                log.warning("Order %s FILLED! Placing sell at front of ask queue.", order_id)
+                side = str(pos.get("side") or "").upper()
+                log.warning("Order %s %s FILLED.", order_id, side or "?")
                 await db.update_position_status(
                     order_id, "FILLED",
                     filled_at=datetime.now(timezone.utc).isoformat(),
                 )
-                # Get live order book to place sell at optimal ask price
-                ob_for_sell = await self._get_order_book_ws_first(pos["token_id"], "filled_buy_sell")
-                live_mid_sell = mid_from_order_book(ob_for_sell)
-                live_asks = _extract_asks(ob_for_sell)
-                market_info = candidate_map.get(pos["condition_id"])
-                spread_for_sell = market_info.rewards_max_spread if market_info else 0.04
-                sell_mid = live_mid_sell or pos["price"]
-                sell_price = calc_sell_order_price(sell_mid, spread_for_sell, live_asks)
+                if side == "SELL":
+                    continue
 
-                resp = await client.place_limit(pos["token_id"], sell_price, pos["size"], "SELL")
-                if resp:
-                    sell_order_id = str(getattr(resp, "order_id", "") or getattr(resp, "id", ""))
-                    if sell_order_id:
-                        await db.upsert_position({
-                            "order_id": sell_order_id,
-                            "condition_id": pos["condition_id"],
-                            "market_question": pos.get("market_question", ""),
-                            "token_id": pos["token_id"],
-                            "outcome": pos.get("outcome", ""),
-                            "side": "SELL",
-                            "price": sell_price,
-                            "size": pos["size"],
-                            "status": "OPEN",
-                            "placed_at": datetime.now(timezone.utc).isoformat(),
-                            "filled_at": None,
-                            "reward_earned": 0,
-                        })
-                        log.info(
-                            "Sell order %s placed @ %.3f for filled BUY %s | %s",
-                            sell_order_id, sell_price, order_id,
-                            pos.get("market_question", "")[:50],
-                        )
+                log.warning("Preparing exit sell for filled BUY %s.", order_id)
+                filled_pos = {**pos, "status": "FILLED", "filled_at": datetime.now(timezone.utc).isoformat()}
+                await self._place_exit_sell_for_buy(filled_pos, cfg, candidate_map, "filled_buy_sell")
                 continue
 
             if status in ("CANCELLED", "CANCELED"):
@@ -1159,6 +1362,7 @@ class FarmingBot:
             else:
                 # ── BUY: existing bid-side logic ─────────────────────────────
                 live_bids = _extract_bids(order_book)
+                live_asks = _extract_asks(order_book)
 
                 if live_mid is not None:
                     new_target = calc_order_price(live_mid, spread, depth, bids=live_bids)
@@ -1170,8 +1374,13 @@ class FarmingBot:
                         continue
                     new_target = calc_order_price(pos["price"] / 0.97, spread, depth)
 
+                if depth == "first" and live_mid is not None:
+                    new_target = self._first_position_price(
+                        live_mid, spread, live_bids,
+                    )
+
                 # ── Check 2: we're the best bid → step down to 2nd level ─────
-                if live_bids:
+                if depth != "first" and live_bids:
                     best_bid = round(live_bids[0], 3)
                     levels = sorted(set(round(b, 3) for b in live_bids), reverse=True)
                     we_are_first = abs(current_price - best_bid) < 0.0005
@@ -1187,11 +1396,12 @@ class FarmingBot:
                             new_target = second_level
 
                 price_drift = abs(current_price - new_target) > 0.001
+                max_level_share_enabled = bool(cfg.get("target_level_share_enabled", True))
                 max_level_share = float(cfg.get("max_target_level_share_pct", 50.0) or 0)
                 confirm_s = max(0.0, float(cfg.get("target_level_share_confirm_s", 5) or 0))
                 min_size = math.ceil(market_info.rewards_min_size) if market_info else 1
 
-                if order_book is not None and max_level_share > 0 and not price_drift:
+                if order_book is not None and max_level_share_enabled and max_level_share > 0 and not price_drift:
                     level_usdc = self._book_level_usdc(order_book, "BUY", current_price)
                     order_usdc = current_price * float(pos["size"])
                     target_order_usdc = max(0.0, float(cfg.get("order_usdc", 0) or 0))
@@ -1268,9 +1478,12 @@ class FarmingBot:
                             await self._replace_open_order(pos, current_price, new_size)
                             continue
 
+                if not max_level_share_enabled:
+                    self._level_share_breach_since.pop(order_id, None)
+
                 if price_drift:
                     replace_size = float(pos["size"])
-                    if order_book is not None and max_level_share > 0:
+                    if order_book is not None and max_level_share_enabled and max_level_share > 0:
                         existing_level_usdc = self._book_level_usdc(order_book, "BUY", new_target)
                         max_cost = self._max_order_cost_for_level(existing_level_usdc, max_level_share)
                         capped_size = math.floor(max_cost / new_target) if new_target > 0 else 0
@@ -1298,11 +1511,13 @@ class FarmingBot:
 
     # ── Recover missing sell orders ─────────────────────────────────────────────
 
-    async def _recover_missing_sells(self) -> None:
+    async def _recover_missing_sells(self, cfg: dict | None = None) -> None:
         """Find FILLED BUY positions with no open SELL and place the missing sell orders."""
         orphans = await db.get_filled_buys_without_sell()
         if not orphans:
             return
+        if cfg is None:
+            cfg = await self._load_cfg()
 
         candidate_map = {m.condition_id: m for m in self.last_scan}
 
@@ -1311,53 +1526,99 @@ class FarmingBot:
                 "Recovering missing SELL for filled BUY %s | %s",
                 pos["order_id"], pos.get("market_question", "")[:50],
             )
-            ob = await self._get_order_book_ws_first(pos["token_id"], "recover_sell")
-            if ob is None:
-                # Orderbook gone → market resolved/closed; stop retrying
-                log.info(
-                    "Market resolved (no orderbook), marking BUY %s as CANCELLED | %s",
-                    pos["order_id"], pos.get("market_question", "")[:50],
+            await self._place_exit_sell_for_buy(pos, cfg, candidate_map, "recover_sell")
+
+    async def _place_exit_sell_for_buy(
+        self,
+        pos: dict,
+        cfg: dict,
+        candidate_map: dict[str, ScoredMarket],
+        purpose: str,
+    ) -> bool:
+        ob = await self._get_order_book_ws_first(pos["token_id"], purpose)
+        if ob is None:
+            log.info(
+                "Market resolved (no orderbook), marking BUY %s as CANCELLED | %s",
+                pos["order_id"], pos.get("market_question", "")[:50],
+            )
+            await db.update_position_status(pos["order_id"], "CANCELLED")
+            return False
+
+        sell_mode = str(cfg.get("sell_mode") or "maker").lower()
+        now = datetime.now(timezone.utc)
+        if sell_mode == "market_after_delay":
+            delay_s = max(0, int(cfg.get("market_sell_delay_s", 60) or 0))
+            filled_at = _parse_dt(pos.get("filled_at")) or now
+            elapsed_s = (now - filled_at).total_seconds()
+            if elapsed_s < delay_s:
+                log.debug(
+                    "Wait before market SELL for BUY %s: %.0fs/%.0fs | %s",
+                    pos["order_id"], elapsed_s, delay_s,
+                    pos.get("market_question", "")[:50],
                 )
-                await db.update_position_status(pos["order_id"], "CANCELLED")
-                continue
+                return True
 
-            live_mid = mid_from_order_book(ob)
-            live_asks = _extract_asks(ob)
-            market_info = candidate_map.get(pos["condition_id"])
-            spread = market_info.rewards_max_spread if market_info else 0.04
-            sell_mid = live_mid or pos["price"]
-            sell_price = calc_sell_order_price(sell_mid, spread, live_asks)
+        live_mid = mid_from_order_book(ob)
+        live_asks = _extract_asks(ob)
+        live_bids = _extract_bids(ob)
+        market_info = candidate_map.get(pos["condition_id"])
+        spread = market_info.rewards_max_spread if market_info else 0.04
+        sell_mid = live_mid or pos["price"]
+        sell_price = calc_sell_order_price(sell_mid, spread, live_asks)
+        post_only = True
+        exit_kind = "maker"
 
-            resp = await client.place_limit(pos["token_id"], sell_price, pos["size"], "SELL")
-            if resp:
-                sell_order_id = str(getattr(resp, "order_id", "") or getattr(resp, "id", ""))
-                if sell_order_id:
-                    await db.upsert_position({
-                        "order_id": sell_order_id,
-                            "condition_id": pos["condition_id"],
-                            "market_question": pos.get("market_question", ""),
-                            "token_id": pos["token_id"],
-                            "outcome": pos.get("outcome", ""),
-                            "side": "SELL",
-                        "price": sell_price,
-                        "size": pos["size"],
-                        "status": "OPEN",
-                        "placed_at": datetime.now(timezone.utc).isoformat(),
-                        "filled_at": None,
-                        "reward_earned": 0,
-                    })
-                    log.info(
-                        "Recovered SELL %s @ %.3f for BUY %s | %s",
-                        sell_order_id, sell_price, pos["order_id"],
-                        pos.get("market_question", "")[:50],
-                    )
+        if sell_mode == "market_after_delay" and live_bids:
+            best_bid = live_bids[0]
+            policy = str(cfg.get("market_sell_policy") or "always").lower()
+            max_gap_cents = max(0.0, float(cfg.get("market_sell_max_gap_cents", 4.0) or 0))
+            gap_cents = (float(pos["price"]) - best_bid) * 100.0
+            if policy != "max_gap" or gap_cents <= max_gap_cents + 1e-9:
+                sell_price = best_bid
+                post_only = False
+                exit_kind = "market_bid"
             else:
-                # Permanent failure (no tokens — market likely resolved with no position to sell)
-                log.warning(
-                    "Cannot place SELL for %s (no tokens or balance), marking BUY as CANCELLED | %s",
-                    pos["order_id"], pos.get("market_question", "")[:50],
+                log.info(
+                    "Fallback to maker SELL for BUY %s: best bid %.2f¢ is %.1f¢ below buy %.2f¢ (max %.1f¢) | %s",
+                    pos["order_id"], best_bid * 100, gap_cents, float(pos["price"]) * 100,
+                    max_gap_cents, pos.get("market_question", "")[:50],
                 )
-                await db.update_position_status(pos["order_id"], "CANCELLED")
+
+        resp = await client.place_limit(pos["token_id"], sell_price, pos["size"], "SELL", post_only=post_only)
+        if resp:
+            sell_order_id = str(getattr(resp, "order_id", "") or getattr(resp, "id", ""))
+            if sell_order_id:
+                post_status = str(getattr(resp, "status", "") or "").upper()
+                status = "FILLED" if post_status in ("MATCHED", "FILLED") else "OPEN"
+                await db.upsert_position({
+                    "order_id": sell_order_id,
+                    "condition_id": pos["condition_id"],
+                    "market_question": pos.get("market_question", ""),
+                    "token_id": pos["token_id"],
+                    "outcome": pos.get("outcome", ""),
+                    "side": "SELL",
+                    "price": sell_price,
+                    "size": pos["size"],
+                    "status": status,
+                    "placed_at": now.isoformat(),
+                    "filled_at": now.isoformat() if status == "FILLED" else None,
+                    "reward_earned": 0,
+                    "parent_order_id": pos["order_id"],
+                    "source": pos.get("source", "BOT"),
+                })
+                log.info(
+                    "%s SELL %s placed @ %.3f status=%s for filled BUY %s | %s",
+                    exit_kind, sell_order_id, sell_price, status, pos["order_id"],
+                    pos.get("market_question", "")[:50],
+                )
+                return True
+
+        log.warning(
+            "Cannot place SELL for %s (no tokens or balance), marking BUY as CANCELLED | %s",
+            pos["order_id"], pos.get("market_question", "")[:50],
+        )
+        await db.update_position_status(pos["order_id"], "CANCELLED")
+        return False
 
     # ── Config helpers ──────────────────────────────────────────────────────────
 
@@ -1381,9 +1642,19 @@ class FarmingBot:
             "max_ob_spread":       await db.get_setting("max_ob_spread",       s.max_ob_spread),
             "max_daily_trades":    await db.get_setting("max_daily_trades",    s.max_daily_trades),
             "max_bid_depth_spread": await db.get_setting("max_bid_depth_spread", s.max_bid_depth_spread),
+            "target_level_share_enabled": await db.get_setting("target_level_share_enabled", s.target_level_share_enabled),
             "max_target_level_share_pct": await db.get_setting("max_target_level_share_pct", s.max_target_level_share_pct),
             "target_level_share_confirm_s": await db.get_setting("target_level_share_confirm_s", s.target_level_share_confirm_s),
+            "sell_mode":           await db.get_setting("sell_mode",           s.sell_mode),
+            "market_sell_delay_s": await db.get_setting("market_sell_delay_s", s.market_sell_delay_s),
+            "market_sell_policy":  await db.get_setting("market_sell_policy",  s.market_sell_policy),
+            "market_sell_max_gap_cents": await db.get_setting("market_sell_max_gap_cents", s.market_sell_max_gap_cents),
             "monitor_interval_s":  await db.get_setting("monitor_interval_s",  s.monitor_interval_s),
+            "front_run_protection": await db.get_setting("front_run_protection", s.front_run_protection),
+            "front_run_bid_threshold_usd": await db.get_setting("front_run_bid_threshold_usd", s.front_run_bid_threshold_usd),
+            "front_run_eat_pct":   await db.get_setting("front_run_eat_pct",   s.front_run_eat_pct),
+            "front_run_window_s":  await db.get_setting("front_run_window_s",  s.front_run_window_s),
+            "front_run_cooldown_s": await db.get_setting("front_run_cooldown_s", s.front_run_cooldown_s),
             "max_order_usdc":      await db.get_setting("max_order_usdc",      s.max_order_usdc),
             "max_positions":       await db.get_setting("max_positions",       s.max_positions),
             "word_blacklist":      await db.get_setting("word_blacklist",      s.word_blacklist),
@@ -1397,3 +1668,15 @@ def _short_id(value: str, head: int = 10, tail: int = 6) -> str:
     if not value:
         return "?"
     return value if len(value) <= head + tail + 1 else f"{value[:head]}...{value[-tail:]}"
+
+
+def _parse_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None

@@ -444,10 +444,20 @@ class BotSettings(BaseModel):
     min_spread: float | None = None
     max_ob_spread: float | None = None
     max_bid_depth_spread: float | None = None
+    target_level_share_enabled: bool | None = None
     max_target_level_share_pct: float | None = None
     target_level_share_confirm_s: int | None = None
+    sell_mode: str | None = None
+    market_sell_delay_s: int | None = None
+    market_sell_policy: str | None = None
+    market_sell_max_gap_cents: float | None = None
     max_daily_trades: int | None = None
     monitor_interval_s: int | None = None
+    front_run_protection: bool | None = None
+    front_run_bid_threshold_usd: float | None = None
+    front_run_eat_pct: float | None = None
+    front_run_window_s: float | None = None
+    front_run_cooldown_s: float | None = None
     max_order_usdc: float | None = None
     max_positions: int | None = None
     word_blacklist: list[str] | None = None
@@ -474,10 +484,20 @@ async def get_settings():
         "min_spread":           cfg.min_spread,
         "max_ob_spread":        cfg.max_ob_spread,
         "max_bid_depth_spread": cfg.max_bid_depth_spread,
+        "target_level_share_enabled": cfg.target_level_share_enabled,
         "max_target_level_share_pct": cfg.max_target_level_share_pct,
         "target_level_share_confirm_s": cfg.target_level_share_confirm_s,
+        "sell_mode":            cfg.sell_mode,
+        "market_sell_delay_s":  cfg.market_sell_delay_s,
+        "market_sell_policy":   cfg.market_sell_policy,
+        "market_sell_max_gap_cents": cfg.market_sell_max_gap_cents,
         "max_daily_trades":     cfg.max_daily_trades,
         "monitor_interval_s":   cfg.monitor_interval_s,
+        "front_run_protection": cfg.front_run_protection,
+        "front_run_bid_threshold_usd": cfg.front_run_bid_threshold_usd,
+        "front_run_eat_pct":    cfg.front_run_eat_pct,
+        "front_run_window_s":   cfg.front_run_window_s,
+        "front_run_cooldown_s": cfg.front_run_cooldown_s,
         "max_order_usdc":       cfg.max_order_usdc,
         "max_positions":        cfg.max_positions,
         "word_blacklist":       cfg.word_blacklist,
@@ -503,6 +523,26 @@ async def update_settings(body: BotSettings):
         data["max_target_level_share_pct"] = min(99.0, max(0.0, float(data["max_target_level_share_pct"])))
     if "target_level_share_confirm_s" in data:
         data["target_level_share_confirm_s"] = max(0, int(data["target_level_share_confirm_s"]))
+    if "sell_mode" in data:
+        mode = str(data["sell_mode"] or "maker").lower()
+        data["sell_mode"] = mode if mode in ("maker", "market_after_delay") else "maker"
+    if "market_sell_delay_s" in data:
+        data["market_sell_delay_s"] = max(0, int(data["market_sell_delay_s"]))
+    if "market_sell_policy" in data:
+        policy = str(data["market_sell_policy"] or "always").lower()
+        data["market_sell_policy"] = policy if policy in ("always", "max_gap") else "always"
+    if "market_sell_max_gap_cents" in data:
+        data["market_sell_max_gap_cents"] = max(0.0, float(data["market_sell_max_gap_cents"]))
+    if "front_run_protection" in data:
+        data["front_run_protection"] = bool(data["front_run_protection"])
+    if "front_run_bid_threshold_usd" in data:
+        data["front_run_bid_threshold_usd"] = max(0.0, float(data["front_run_bid_threshold_usd"]))
+    if "front_run_eat_pct" in data:
+        data["front_run_eat_pct"] = min(100.0, max(1.0, float(data["front_run_eat_pct"])))
+    if "front_run_window_s" in data:
+        data["front_run_window_s"] = max(0.1, float(data["front_run_window_s"]))
+    if "front_run_cooldown_s" in data:
+        data["front_run_cooldown_s"] = max(0.0, float(data["front_run_cooldown_s"]))
     for k, v in data.items():
         await db.set_setting(k, v)
     return data

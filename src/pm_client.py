@@ -29,6 +29,25 @@ def _is_conn_error(e: Exception) -> bool:
     return any(kw in str(e).lower() for kw in _CONN_ERRORS)
 
 
+def _paginator_items(paginator: Any) -> list[Any]:
+    iter_items = getattr(paginator, "iter_items", None)
+    if callable(iter_items):
+        return list(iter_items())
+
+    items = getattr(paginator, "items", None)
+    if callable(items):
+        return list(items())
+
+    out: list[Any] = []
+    for entry in paginator:
+        page_items = getattr(entry, "items", None)
+        if page_items is not None and not callable(page_items):
+            out.extend(page_items)
+        else:
+            out.append(entry)
+    return out
+
+
 class PMClient:
     def __init__(self) -> None:
         self._pub: PublicClient | None = None
@@ -69,7 +88,7 @@ class PMClient:
                 paginator = await loop.run_in_executor(
                     None, lambda: self._public().list_current_rewards()
                 )
-                return list(paginator.items())
+                return _paginator_items(paginator)
             except Exception as e:
                 if _is_conn_error(e) and attempt == 0:
                     log.warning("get_all_rewards connection reset, retrying: %s", e)
@@ -86,7 +105,7 @@ class PMClient:
                     None,
                     lambda: self._public().list_market_rewards(condition_id=condition_id),
                 )
-                for item in paginator.items():
+                for item in _paginator_items(paginator):
                     return item
                 return None
             except Exception as e:
@@ -246,6 +265,7 @@ class PMClient:
         price: float,
         size: float,
         side: str,
+        post_only: bool = True,
     ) -> OrderResponse | None:
         loop = asyncio.get_event_loop()
         for attempt in range(4):
@@ -258,7 +278,7 @@ class PMClient:
                         price=Decimal(str(p)),
                         size=Decimal(str(size)),
                         side=side,
-                        post_only=True,
+                        post_only=post_only,
                         builder_code=settings.builder_code.strip() or None,
                     ),
                 )
@@ -331,7 +351,7 @@ class PMClient:
                     None,
                     lambda: self._secure().list_open_orders(),
                 )
-                return list(paginator.items())
+                return _paginator_items(paginator)
             except Exception as e:
                 if _is_conn_error(e) and attempt == 0:
                     log.warning("list_open_orders connection reset, retrying: %s", e)
@@ -348,7 +368,7 @@ class PMClient:
                     None,
                     lambda: self._secure().list_positions(size_threshold=0.0001, page_size=100),
                 )
-                return list(paginator.items())
+                return _paginator_items(paginator)
             except Exception as e:
                 if _is_conn_error(e) and attempt == 0:
                     log.warning("list_positions connection reset, retrying: %s", e)

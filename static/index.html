@@ -99,6 +99,10 @@
             Макс. глубина bid, ¢
             <input id="s-max-bid-depth" type="number" min="1" max="30" step="0.5" value="4" />
           </label>
+          <label class="toggle-label" title="Когда выключено, бот не ограничивает размер BUY по своей доле на точном ценовом уровне. Полезно для режима «1-я позиция».">
+            Ограничивать долю уровня
+            <input id="s-level-share-enabled" type="checkbox" checked aria-controls="s-max-level-share s-level-share-confirm" />
+          </label>
           <label title="Максимальная доля точного целевого bid-уровня, которую может занимать BUY-ордер бота. Если ордер больше — бот уменьшит размер">
             Макс. доля уровня, %
             <input id="s-max-level-share" type="number" min="0" max="99" step="1" value="50" />
@@ -107,6 +111,28 @@
             Подтверждение доли, сек
             <input id="s-level-share-confirm" type="number" min="0" max="30" step="1" value="5" />
           </label>
+          <label title="Что делать после исполнения BUY: текущий режим ставит SELL в первый ask-ряд; рыночный режим ждёт и продаёт по лучшему bid.">
+            Режим Sell
+            <select id="s-sell-mode">
+              <option value="maker">В первый ряд сверху</option>
+              <option value="market_after_delay">Через 60 сек по рынку</option>
+            </select>
+          </label>
+          <label title="Пауза после исполнения BUY перед попыткой продать по лучшей цене покупки.">
+            Задержка market Sell, сек
+            <input id="s-market-sell-delay" type="number" min="0" max="600" step="5" value="60" />
+          </label>
+          <label title="Всегда продавать по лучшему bid или только если он не слишком далеко от цены покупки.">
+            Условие market Sell
+            <select id="s-market-sell-policy">
+              <option value="always">Продавать всегда</option>
+              <option value="max_gap">Только если просадка ≤ лимита</option>
+            </select>
+          </label>
+          <label title="Если BUY был по 38¢, при лимите 4¢ market Sell разрешён до 34¢ включительно; ниже будет обычный SELL в ask.">
+            Макс. просадка Sell, ¢
+            <input id="s-market-sell-gap" type="number" min="0" max="50" step="0.5" value="4" />
+          </label>
           <label title="Макс. изменений цены в день. Рынки активнее этого порога — не мёртвые, пропускаются">
             Макс. сделок в день
             <input id="s-max-daily-trades" type="number" min="0" max="50" step="1" value="3" />
@@ -114,6 +140,26 @@
           <label title="Частота проверки позиций в секундах. 5 = агрессивно, 30 = экономно по API">
             Проверка позиций, сек
             <input id="s-monitor-interval" type="number" min="5" max="120" step="5" value="5" />
+          </label>
+          <label class="toggle-label" title="Отменять BUY если тонкий уровень перед ботом быстро едят. Защита от входа в очередь на исполнение.">
+            Защита от подъедания стакана
+            <input id="s-front-run-protection" type="checkbox" />
+          </label>
+          <label title="Если best bid (в USDC) ниже этого порога — защита активна. Выше — уровень считается толстым, бот не паникует.">
+            Порог тонкого уровня, $
+            <input id="s-front-run-bid-threshold" type="number" min="1" step="1" value="15" />
+          </label>
+          <label title="Какой % уровня должен быть съеден за окно наблюдения, чтобы сработала отмена.">
+            Порог потребления, %
+            <input id="s-front-run-eat-pct" type="number" min="1" max="100" step="1" value="30" />
+          </label>
+          <label title="Окно наблюдения за скоростью потребления (сек).">
+            Окно наблюдения, сек
+            <input id="s-front-run-window" type="number" min="0.5" step="0.5" value="3" />
+          </label>
+          <label title="Сколько секунд бот ждёт перед повторным входом после отмены из-за подъедания.">
+            Кулдаун после отмены, сек
+            <input id="s-front-run-cooldown" type="number" min="1" step="1" value="15" />
           </label>
         </div>
         <label class="word-bl-label" title="Слова через запятую. Рынки с этими словами — пропускаются и закрываются">
@@ -287,6 +333,6 @@
     </section>
   </main>
 
-  <script src="/static/app.js?v=scanner-mode-2"></script>
+  <script src="/static/app.js?v=level-share-1"></script>
 </body>
 </html>

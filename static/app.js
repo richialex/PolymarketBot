@@ -430,12 +430,29 @@ async function loadSettings() {
   if (data.min_spread != null)           document.getElementById('s-min-spread').value = data.min_spread;
   if (data.max_ob_spread != null)        document.getElementById('s-max-ob-spread').value = data.max_ob_spread;
   if (data.max_bid_depth_spread != null) document.getElementById('s-max-bid-depth').value = data.max_bid_depth_spread;
+  if (data.target_level_share_enabled != null) document.getElementById('s-level-share-enabled').checked = !!data.target_level_share_enabled;
   if (data.max_target_level_share_pct != null) document.getElementById('s-max-level-share').value = data.max_target_level_share_pct;
   if (data.target_level_share_confirm_s != null) document.getElementById('s-level-share-confirm').value = data.target_level_share_confirm_s;
+  if (data.sell_mode != null)              document.getElementById('s-sell-mode').value = data.sell_mode;
+  if (data.market_sell_delay_s != null)    document.getElementById('s-market-sell-delay').value = data.market_sell_delay_s;
+  if (data.market_sell_policy != null)     document.getElementById('s-market-sell-policy').value = data.market_sell_policy;
+  if (data.market_sell_max_gap_cents != null) document.getElementById('s-market-sell-gap').value = data.market_sell_max_gap_cents;
   if (data.max_daily_trades != null)     document.getElementById('s-max-daily-trades').value = data.max_daily_trades;
   if (data.monitor_interval_s != null)   document.getElementById('s-monitor-interval').value = data.monitor_interval_s;
+  if (data.front_run_protection != null) document.getElementById('s-front-run-protection').checked = !!data.front_run_protection;
+  if (data.front_run_bid_threshold_usd != null) document.getElementById('s-front-run-bid-threshold').value = data.front_run_bid_threshold_usd;
+  if (data.front_run_eat_pct != null)    document.getElementById('s-front-run-eat-pct').value = data.front_run_eat_pct;
+  if (data.front_run_window_s != null)   document.getElementById('s-front-run-window').value = data.front_run_window_s;
+  if (data.front_run_cooldown_s != null) document.getElementById('s-front-run-cooldown').value = data.front_run_cooldown_s;
   if (data.word_blacklist != null)       document.getElementById('s-word-blacklist').value = (data.word_blacklist || []).join(', ');
+  updateLevelShareControls();
   updateOrderBudgetLimit();
+}
+
+function updateLevelShareControls() {
+  const enabled = document.getElementById('s-level-share-enabled').checked;
+  document.getElementById('s-max-level-share').disabled = !enabled;
+  document.getElementById('s-level-share-confirm').disabled = !enabled;
 }
 
 async function saveSettings() {
@@ -461,10 +478,20 @@ async function saveSettings() {
     min_spread:           parseFloat(document.getElementById('s-min-spread').value),
     max_ob_spread:        parseFloat(document.getElementById('s-max-ob-spread').value),
     max_bid_depth_spread: parseFloat(document.getElementById('s-max-bid-depth').value),
+    target_level_share_enabled: document.getElementById('s-level-share-enabled').checked,
     max_target_level_share_pct: parseFloat(document.getElementById('s-max-level-share').value),
     target_level_share_confirm_s: parseInt(document.getElementById('s-level-share-confirm').value),
+    sell_mode:            document.getElementById('s-sell-mode').value,
+    market_sell_delay_s:  parseInt(document.getElementById('s-market-sell-delay').value),
+    market_sell_policy:   document.getElementById('s-market-sell-policy').value,
+    market_sell_max_gap_cents: parseFloat(document.getElementById('s-market-sell-gap').value),
     max_daily_trades:     parseInt(document.getElementById('s-max-daily-trades').value),
     monitor_interval_s:   parseInt(document.getElementById('s-monitor-interval').value),
+    front_run_protection: document.getElementById('s-front-run-protection').checked,
+    front_run_bid_threshold_usd: parseFloat(document.getElementById('s-front-run-bid-threshold').value),
+    front_run_eat_pct:    parseFloat(document.getElementById('s-front-run-eat-pct').value),
+    front_run_window_s:   parseFloat(document.getElementById('s-front-run-window').value),
+    front_run_cooldown_s: parseFloat(document.getElementById('s-front-run-cooldown').value),
     word_blacklist:       wordList,
   };
   const response = await fetch(`${API}/api/settings`, {
@@ -481,6 +508,8 @@ async function saveSettings() {
   msg.textContent = 'Сохранено ✓';
   setTimeout(() => msg.textContent = '', 2000);
 }
+
+document.getElementById('s-level-share-enabled').addEventListener('change', updateLevelShareControls);
 
 function updateOrderBudgetLimit() {
   const input = document.getElementById('s-order-usdc');

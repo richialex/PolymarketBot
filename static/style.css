@@ -92,6 +92,13 @@ body { background: var(--bg); color: var(--text); font-family: var(--font); font
 }
 .settings-grid input:focus,
 .settings-grid select:focus { outline: 2px solid var(--accent); border-color: transparent; }
+.settings-grid input:disabled { opacity: 0.5; cursor: not-allowed; }
+.settings-grid input[type="checkbox"] {
+  width: 18px; height: 18px; padding: 0; border-radius: 4px;
+  accent-color: var(--accent); cursor: pointer; align-self: flex-start; margin-top: 2px;
+}
+.settings-grid .toggle-label { flex-direction: row; align-items: center; gap: 8px; }
+.settings-grid .toggle-label input[type="checkbox"] { align-self: center; margin-top: 0; flex: 0 0 18px; }
 .settings-footer { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
 .msg { font-size: 12px; color: var(--green); }
 

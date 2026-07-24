@@ -241,7 +241,7 @@ async def get_position_history_for_condition(condition_id: str, exclude_order_id
 
 
 async def get_filled_buys_without_sell() -> list[dict]:
-    """Return FILLED BUY positions that have no corresponding OPEN SELL for same token."""
+    """Return FILLED BUY positions that have no corresponding SELL exit."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
@@ -250,9 +250,16 @@ async def get_filled_buys_without_sell() -> list[dict]:
               AND p.side = 'BUY'
               AND NOT EXISTS (
                   SELECT 1 FROM positions s
-                  WHERE s.token_id = p.token_id
-                    AND s.side = 'SELL'
-                    AND s.status IN ('OPEN', 'WARNING')
+                  WHERE s.side = 'SELL'
+                    AND (
+                      s.parent_order_id = p.order_id
+                      OR (
+                        s.parent_order_id IS NULL
+                        AND s.token_id = p.token_id
+                        AND s.status IN ('OPEN', 'WARNING', 'SELL_PENDING', 'SELL_OPEN')
+                      )
+                    )
+                    AND s.status IN ('OPEN', 'WARNING', 'SELL_PENDING', 'SELL_OPEN', 'FILLED')
               )
             ORDER BY p.filled_at DESC
         """) as cursor:

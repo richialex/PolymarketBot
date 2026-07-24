@@ -5,7 +5,8 @@
 1. Add a global REST rate limiter.
 2. Add exponential backoff for `429`, `5xx`, timeouts, and transient connection errors.
 3. Further reduce non-critical REST polling now that user/order WebSocket handling is proven.
-4. Add round-robin monitor mode for large active position counts.
+4. Split the fast position monitor interval from the slower `trade_once` cadence so WS protection can stay quick while balance/rebalance REST calls run at a calmer 15-30s interval.
+5. Add round-robin monitor mode for large active position counts.
 
 ## WebSocket Follow-Up
 
