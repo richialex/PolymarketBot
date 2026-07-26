@@ -4,10 +4,22 @@ from __future__ import annotations
 import json
 import aiosqlite
 from pathlib import Path
+from datetime import datetime, timezone
 
 DB_PATH = Path(__file__).parent.parent / "farm.db"
-ACTIVE_POSITION_STATUSES = ("PENDING_PLACE", "OPEN", "WARNING", "SELL_PENDING", "SELL_OPEN")
-CAPITAL_IN_USE_STATUSES = ("PENDING_PLACE", "OPEN", "WARNING", "FILLED")
+WORKING_ORDER_STATUSES = (
+    "PENDING_PLACE",
+    "OPEN",
+    "WARNING",
+    "PARTIALLY_FILLED",
+    "CANCEL_PENDING",
+    "RECONCILE_REQUIRED",
+    "SELL_PENDING",
+    "SELL_OPEN",
+)
+LIVE_ORDER_STATUSES = ("OPEN", "WARNING", "PARTIALLY_FILLED", "SELL_OPEN")
+ACTIVE_POSITION_STATUSES = WORKING_ORDER_STATUSES + ("EXIT_REQUIRED", "EXITING")
+QUOTE_NOTIONAL_STATUSES = WORKING_ORDER_STATUSES
 
 _CREATE_POSITIONS = """
 CREATE TABLE IF NOT EXISTS positions (
@@ -53,6 +65,47 @@ CREATE TABLE IF NOT EXISTS market_bans (
 )
 """
 
+_CREATE_ORDER_FILLS = """
+CREATE TABLE IF NOT EXISTS order_fills (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id        TEXT NOT NULL,
+    condition_id    TEXT NOT NULL,
+    token_id        TEXT NOT NULL,
+    side            TEXT NOT NULL,
+    market_question TEXT NOT NULL DEFAULT '',
+    last_price      REAL NOT NULL DEFAULT 0,
+    last_size       REAL NOT NULL DEFAULT 0,
+    delta_size      REAL NOT NULL,
+    cumulative_size REAL NOT NULL,
+    price           REAL NOT NULL,
+    event_at        TEXT NOT NULL,
+    source          TEXT NOT NULL DEFAULT 'WS',
+    UNIQUE(order_id, cumulative_size)
+)
+"""
+
+_CREATE_ORDER_ATTEMPTS = """
+CREATE TABLE IF NOT EXISTS order_attempts (
+    condition_id    TEXT NOT NULL,
+    token_id        TEXT NOT NULL,
+    side            TEXT NOT NULL,
+    attempt_count   INTEGER NOT NULL DEFAULT 0,
+    accepted_count  INTEGER NOT NULL DEFAULT 0,
+    rejected_count  INTEGER NOT NULL DEFAULT 0,
+    ambiguous_count INTEGER NOT NULL DEFAULT 0,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_local_id   TEXT,
+    last_order_id   TEXT,
+    last_outcome    TEXT NOT NULL DEFAULT '',
+    last_error_code TEXT NOT NULL DEFAULT '',
+    last_error_message TEXT NOT NULL DEFAULT '',
+    first_attempt_at TEXT NOT NULL,
+    last_attempt_at TEXT NOT NULL,
+    next_retry_at   TEXT,
+    PRIMARY KEY(condition_id, token_id, side)
+)
+"""
+
 
 async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -65,6 +118,38 @@ async def init_db() -> None:
         await db.execute(_CREATE_SETTINGS)
         await db.execute(_CREATE_BALANCE_SNAPSHOTS)
         await db.execute(_CREATE_MARKET_BANS)
+        await db.execute(_CREATE_ORDER_FILLS)
+        await db.execute(_CREATE_ORDER_ATTEMPTS)
+        await _ensure_column(
+            db,
+            "order_attempts",
+            "consecutive_failures",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        await _ensure_column(db, "order_attempts", "market_question", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "order_attempts", "last_price", "REAL NOT NULL DEFAULT 0")
+        await _ensure_column(db, "order_attempts", "last_size", "REAL NOT NULL DEFAULT 0")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_positions_status_side ON positions(status, side)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_positions_condition ON positions(condition_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_positions_token ON positions(token_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_positions_parent ON positions(parent_order_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_order_fills_order ON order_fills(order_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_order_fills_token ON order_fills(token_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_order_attempts_retry ON order_attempts(next_retry_at)"
+        )
         await db.commit()
 
 
@@ -136,6 +221,89 @@ async def update_position_matched_size(order_id: str, matched_size: float) -> No
         await db.commit()
 
 
+async def record_cumulative_match(
+    order_id: str,
+    cumulative_size: float,
+    *,
+    source: str = "WS",
+    event_at: str | None = None,
+) -> dict | None:
+    """Atomically persist a cumulative match update and its positive delta.
+
+    WebSocket order updates report cumulative ``size_matched``.  This function
+    makes duplicate/out-of-order events harmless and is the single source of
+    truth for fill deltas used by inventory/exit handling.
+    """
+    cumulative_size = max(0.0, float(cumulative_size or 0))
+    event_at = event_at or datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("BEGIN IMMEDIATE")
+        async with conn.execute(
+            "SELECT * FROM positions WHERE order_id=?",
+            (order_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            await conn.rollback()
+            return None
+
+        pos = dict(row)
+        previous = max(0.0, float(pos.get("matched_size") or 0))
+        size = max(0.0, float(pos.get("size") or 0))
+        effective = min(size, cumulative_size) if size > 0 else cumulative_size
+        delta = max(0.0, effective - previous)
+        stored_match = max(previous, effective)
+
+        current_status = str(pos.get("status") or "").upper()
+        if size > 0 and stored_match >= size - 0.0001:
+            new_status = "FILLED"
+        elif stored_match > 0 and current_status not in ("EXIT_REQUIRED", "EXITING"):
+            new_status = "PARTIALLY_FILLED"
+        else:
+            new_status = current_status
+
+        if delta > 0:
+            await conn.execute(
+                """
+                INSERT OR IGNORE INTO order_fills
+                    (order_id, condition_id, token_id, side, delta_size,
+                     cumulative_size, price, event_at, source)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    order_id,
+                    pos["condition_id"],
+                    pos["token_id"],
+                    str(pos["side"]).upper(),
+                    delta,
+                    effective,
+                    float(pos["price"]),
+                    event_at,
+                    source,
+                ),
+            )
+
+        await conn.execute(
+            "UPDATE positions SET matched_size=?, status=?, filled_at=? WHERE order_id=?",
+            (
+                stored_match,
+                new_status,
+                event_at if new_status == "FILLED" else pos.get("filled_at"),
+                order_id,
+            ),
+        )
+        await conn.commit()
+        pos.update(
+            {
+                "matched_size": stored_match,
+                "status": new_status,
+                "fill_delta": delta,
+            }
+        )
+        return pos
+
+
 async def get_position(order_id: str) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -156,8 +324,10 @@ async def replace_position_order_id(local_order_id: str, real_order_id: str, sta
 async def get_open_positions() -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
+        placeholders = ",".join("?" for _ in LIVE_ORDER_STATUSES)
         async with db.execute(
-            "SELECT * FROM positions WHERE status IN ('OPEN','WARNING') ORDER BY placed_at DESC"
+            f"SELECT * FROM positions WHERE status IN ({placeholders}) ORDER BY placed_at DESC",
+            LIVE_ORDER_STATUSES,
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
@@ -178,11 +348,15 @@ async def get_active_positions() -> list[dict]:
 async def get_reconcilable_positions() -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("""
+        placeholders = ",".join("?" for _ in WORKING_ORDER_STATUSES)
+        async with db.execute(
+            f"""
             SELECT * FROM positions
-            WHERE status IN ('PENDING_PLACE','OPEN','WARNING','SELL_PENDING','SELL_OPEN')
+            WHERE status IN ({placeholders})
             ORDER BY placed_at DESC
-        """) as cursor:
+            """,
+            WORKING_ORDER_STATUSES,
+        ) as cursor:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
 
@@ -241,30 +415,108 @@ async def get_position_history_for_condition(condition_id: str, exclude_order_id
 
 
 async def get_filled_buys_without_sell() -> list[dict]:
-    """Return FILLED BUY positions that have no corresponding SELL exit."""
+    """Return BUY executions that still need an exit order."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
             SELECT * FROM positions p
-            WHERE p.status = 'FILLED'
+            WHERE p.status IN ('FILLED', 'EXIT_REQUIRED', 'EXITING', 'PARTIALLY_FILLED')
               AND p.side = 'BUY'
+              AND COALESCE(NULLIF(p.matched_size, 0), p.size) > (
+                  SELECT COALESCE(SUM(
+                      CASE
+                        WHEN s.status = 'FILLED' AND s.matched_size = 0 THEN s.size
+                        ELSE s.matched_size
+                      END
+                  ), 0)
+                  FROM positions s
+                  WHERE s.side = 'SELL'
+                    AND s.parent_order_id = p.order_id
+              )
               AND NOT EXISTS (
                   SELECT 1 FROM positions s
                   WHERE s.side = 'SELL'
-                    AND (
-                      s.parent_order_id = p.order_id
-                      OR (
-                        s.parent_order_id IS NULL
-                        AND s.token_id = p.token_id
-                        AND s.status IN ('OPEN', 'WARNING', 'SELL_PENDING', 'SELL_OPEN')
-                      )
+                    AND s.parent_order_id = p.order_id
+                    AND s.status IN (
+                        'PENDING_PLACE','OPEN','WARNING','PARTIALLY_FILLED',
+                        'CANCEL_PENDING','RECONCILE_REQUIRED','SELL_PENDING','SELL_OPEN'
                     )
-                    AND s.status IN ('OPEN', 'WARNING', 'SELL_PENDING', 'SELL_OPEN', 'FILLED')
               )
             ORDER BY p.filled_at DESC
         """) as cursor:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
+
+
+async def get_parent_exit_accounting(parent_order_id: str) -> dict:
+    """Return acquired, sold, working-sell, and uncovered shares for one BUY."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT * FROM positions WHERE order_id=?",
+            (parent_order_id,),
+        ) as cursor:
+            buy = await cursor.fetchone()
+        if buy is None:
+            return {
+                "acquired": 0.0,
+                "sold": 0.0,
+                "working_sell": 0.0,
+                "uncovered": 0.0,
+            }
+
+        buy_d = dict(buy)
+        acquired = float(buy_d.get("matched_size") or 0)
+        if acquired <= 0 and str(buy_d.get("status") or "").upper() == "FILLED":
+            acquired = float(buy_d.get("size") or 0)
+
+        placeholders = ",".join("?" for _ in WORKING_ORDER_STATUSES)
+        params = (parent_order_id, *WORKING_ORDER_STATUSES)
+        async with conn.execute(
+            f"""
+            SELECT
+              COALESCE(SUM(
+                CASE
+                  WHEN status='FILLED' AND matched_size=0 THEN size
+                  ELSE matched_size
+                END
+              ), 0) AS sold,
+              COALESCE(SUM(
+                CASE
+                  WHEN status IN ({placeholders})
+                  THEN MAX(0, size-matched_size)
+                  ELSE 0
+                END
+              ), 0) AS working_sell
+            FROM positions
+            WHERE parent_order_id=? AND side='SELL'
+            """,
+            (*WORKING_ORDER_STATUSES, parent_order_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        sold = float(row["sold"] or 0)
+        working = float(row["working_sell"] or 0)
+        return {
+            "acquired": acquired,
+            "sold": sold,
+            "working_sell": working,
+            "uncovered": max(0.0, acquired - sold - working),
+        }
+
+
+async def get_working_sell_remaining(token_id: str) -> float:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        placeholders = ",".join("?" for _ in WORKING_ORDER_STATUSES)
+        async with conn.execute(
+            f"""
+            SELECT COALESCE(SUM(MAX(0, size-matched_size)), 0)
+            FROM positions
+            WHERE token_id=? AND side='SELL' AND status IN ({placeholders})
+            """,
+            (token_id, *WORKING_ORDER_STATUSES),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return max(0.0, float(row[0] or 0))
 
 
 async def delete_position(order_id: str) -> None:
@@ -381,27 +633,268 @@ async def get_position_stats() -> dict:
 
 
 async def get_bot_capital_in_use() -> float:
-    """Return bot-managed BUY exposure still needing capital accounting."""
+    """Backward-compatible alias for nominal open BUY quotes.
+
+    Cross-market quotes may intentionally reuse the same wallet collateral, so
+    this value is *not* treated as globally locked cash.
+    """
+    return await get_bot_quote_notional()
+
+
+async def get_bot_quote_notional() -> float:
+    """Return remaining nominal value of all working bot BUY quotes."""
     async with aiosqlite.connect(DB_PATH) as db:
-        placeholders = ",".join("?" for _ in CAPITAL_IN_USE_STATUSES)
+        placeholders = ",".join("?" for _ in QUOTE_NOTIONAL_STATUSES)
         async with db.execute(
             f"""
-            SELECT COALESCE(SUM(p.price * p.size), 0)
+            SELECT COALESCE(SUM(p.price * MAX(0, p.size-p.matched_size)), 0)
             FROM positions p
             WHERE p.side = 'BUY'
               AND p.source IN ('BOT', 'ADOPTED')
               AND p.status IN ({placeholders})
-              AND NOT EXISTS (
-                  SELECT 1 FROM positions s
-                  WHERE s.token_id = p.token_id
-                    AND s.side = 'SELL'
-                    AND s.status = 'FILLED'
-              )
             """,
-            CAPITAL_IN_USE_STATUSES,
+            QUOTE_NOTIONAL_STATUSES,
         ) as cur:
             row = await cur.fetchone()
             return round(float(row[0] or 0), 4)
+
+
+async def get_bot_inventory_exposure() -> float:
+    """Return cost-basis exposure of matched BUY shares not yet sold."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute(
+            """
+            SELECT COALESCE(SUM(
+              p.price * MAX(
+                0,
+                (CASE
+                   WHEN p.matched_size > 0 THEN p.matched_size
+                   WHEN p.status='FILLED' THEN p.size
+                   ELSE 0
+                 END)
+                -
+                (SELECT COALESCE(SUM(
+                   CASE
+                     WHEN s.status='FILLED' AND s.matched_size=0 THEN s.size
+                     ELSE s.matched_size
+                   END
+                 ), 0)
+                 FROM positions s
+                 WHERE s.parent_order_id=p.order_id AND s.side='SELL')
+              )
+            ), 0)
+            FROM positions p
+            WHERE p.side='BUY'
+              AND p.source IN ('BOT','ADOPTED')
+            """
+        ) as cursor:
+            row = await cursor.fetchone()
+            return round(float(row[0] or 0), 4)
+
+
+# ── Placement attempts ────────────────────────────────────────────────────────
+
+async def begin_order_attempt(pos: dict) -> None:
+    """Increment one aggregate attempt row before the non-idempotent POST."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            """
+            INSERT INTO order_attempts (
+                condition_id, token_id, side, market_question, last_price, last_size,
+                attempt_count,
+                last_local_id, last_outcome, first_attempt_at, last_attempt_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, 'PENDING', ?, ?)
+            ON CONFLICT(condition_id, token_id, side) DO UPDATE SET
+                attempt_count=order_attempts.attempt_count+1,
+                market_question=excluded.market_question,
+                last_price=excluded.last_price,
+                last_size=excluded.last_size,
+                last_local_id=excluded.last_local_id,
+                last_outcome='PENDING',
+                last_error_code='',
+                last_error_message='',
+                last_attempt_at=excluded.last_attempt_at
+            """,
+            (
+                str(pos.get("condition_id") or ""),
+                str(pos.get("token_id") or ""),
+                str(pos.get("side") or "").upper(),
+                str(pos.get("market_question") or ""),
+                float(pos.get("price") or 0),
+                float(pos.get("size") or 0),
+                str(pos.get("order_id") or ""),
+                now,
+                now,
+            ),
+        )
+        await conn.commit()
+
+
+async def finish_order_attempt(
+    pos: dict,
+    *,
+    outcome: str,
+    error_code: str = "",
+    error_message: str = "",
+    remote_order_id: str = "",
+    retry_delay_s: float = 0.0,
+) -> None:
+    """Finish the latest attempt without creating another positions row."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    next_retry_at = (
+        now + timedelta(seconds=float(retry_delay_s))
+    ).isoformat() if retry_delay_s > 0 else None
+    outcome_upper = str(outcome or "").upper()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            """
+            UPDATE order_attempts
+            SET accepted_count=accepted_count+?,
+                rejected_count=rejected_count+?,
+                ambiguous_count=ambiguous_count+?,
+                consecutive_failures=CASE
+                    WHEN ?='ACCEPTED' THEN 0
+                    WHEN ?='REJECTED' THEN consecutive_failures+1
+                    ELSE consecutive_failures
+                END,
+                last_order_id=?,
+                last_outcome=?,
+                last_error_code=?,
+                last_error_message=?,
+                last_attempt_at=?,
+                next_retry_at=?
+            WHERE condition_id=? AND token_id=? AND side=?
+            """,
+            (
+                1 if outcome_upper == "ACCEPTED" else 0,
+                1 if outcome_upper == "REJECTED" else 0,
+                1 if outcome_upper == "AMBIGUOUS" else 0,
+                outcome_upper,
+                outcome_upper,
+                remote_order_id,
+                outcome_upper,
+                error_code,
+                error_message[:1000],
+                now.isoformat(),
+                next_retry_at,
+                str(pos.get("condition_id") or ""),
+                str(pos.get("token_id") or ""),
+                str(pos.get("side") or "").upper(),
+            ),
+        )
+        await conn.commit()
+
+
+async def get_order_consecutive_failures(
+    condition_id: str,
+    token_id: str,
+    side: str,
+) -> int:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute(
+            """
+            SELECT consecutive_failures
+            FROM order_attempts
+            WHERE condition_id=? AND token_id=? AND side=?
+            """,
+            (condition_id, token_id, str(side).upper()),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return max(0, int(row[0] or 0)) if row else 0
+
+
+async def get_condition_retry_delay(condition_id: str) -> float:
+    """Return persisted seconds until any route in the condition may retry."""
+    now = datetime.now(timezone.utc)
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute(
+            """
+            SELECT MAX(next_retry_at)
+            FROM order_attempts
+            WHERE condition_id=? AND next_retry_at IS NOT NULL
+            """,
+            (condition_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+    if not row or not row[0]:
+        return 0.0
+    try:
+        retry_at = datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (retry_at - now).total_seconds())
+    except ValueError:
+        return 0.0
+
+
+async def get_order_retry_delay(condition_id: str, token_id: str, side: str) -> float:
+    """Return persisted retry delay for one exact placement route."""
+    now = datetime.now(timezone.utc)
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute(
+            """
+            SELECT next_retry_at
+            FROM order_attempts
+            WHERE condition_id=? AND token_id=? AND side=?
+            """,
+            (condition_id, token_id, str(side).upper()),
+        ) as cursor:
+            row = await cursor.fetchone()
+    if not row or not row[0]:
+        return 0.0
+    try:
+        retry_at = datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (retry_at - now).total_seconds())
+    except ValueError:
+        return 0.0
+
+
+async def set_condition_retry_delay(
+    condition_id: str,
+    delay_s: float,
+    *,
+    side: str | None = None,
+) -> None:
+    """Persist a condition-level suppression after a risk-driven cancellation."""
+    from datetime import timedelta
+
+    retry_at = (
+        datetime.now(timezone.utc) + timedelta(seconds=max(0.0, float(delay_s)))
+    ).isoformat()
+    side_filter = " AND side=?" if side else ""
+    params: tuple = (retry_at, retry_at, condition_id)
+    if side:
+        params = (*params, str(side).upper())
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            f"""
+            UPDATE order_attempts
+            SET next_retry_at = CASE
+                    WHEN next_retry_at IS NULL OR next_retry_at < ? THEN ?
+                    ELSE next_retry_at
+                END,
+                last_error_code='cancel_suppression',
+                last_error_message='Risk-driven cancellation cooldown'
+            WHERE condition_id=?{side_filter}
+            """,
+            params,
+        )
+        await conn.commit()
+
+
+async def get_order_attempts(limit: int = 100) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT * FROM order_attempts ORDER BY last_attempt_at DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
 
 
 # ── Settings ───────────────────────────────────────────────────────────────────

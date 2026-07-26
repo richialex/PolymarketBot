@@ -92,7 +92,11 @@ function renderMarketsStatus(s) {
   const cursor = s.cursor ?? 0;
   const mode = s.scanner_mode || 'legacy';
   const updated = s.last_updated ? new Date(s.last_updated).toLocaleTimeString('ru') : '—';
-  el.textContent = `Режим: ${mode}; загружено reward-рынков: ${loaded}; прошли мин. награду: ${passing}; обработано в батче: ${batch}; прошло фильтры: ${scored}; в пуле: ${pool}; показано: ${shown}; курсор: ${cursor}; обновлено: ${updated}`;
+  const h = s.hybrid || {};
+  const hybrid = mode === 'hybrid'
+    ? `; дешёвый фильтр: ${h.cheap_passing ?? 0}/${h.cheap_input ?? 0}; стакан прошли: ${h.book_passing ?? 0}/${h.book_candidates ?? 0}; глубокая проверка: ${h.deep_scored ?? 0}/${h.deep_selected ?? 0}; запросы book/history/meta: ${h.book_requests ?? 0}/${h.history_requests ?? 0}/${h.metadata_requests ?? 0}; время: ${h.duration_ms ?? 0} мс`
+    : '';
+  el.textContent = `Режим: ${mode}; загружено reward-рынков: ${loaded}; прошли мин. награду: ${passing}; обработано в батче: ${batch}; прошло фильтры: ${scored}; в пуле: ${pool}; показано: ${shown}; курсор: ${cursor}${hybrid}; обновлено: ${updated}`;
 }
 
 function renderMarkets(markets) {
@@ -155,7 +159,11 @@ async function fetchUnmanagedPositions() {
 function renderPositions(positions) {
   lastPositions = positions;
   document.getElementById('pos-count').textContent = positions.length;
-  document.getElementById('active-count').textContent = positions.filter(p => p.status === 'OPEN').length;
+  document.getElementById('active-count').textContent = positions.filter(p => [
+    'OPEN', 'WARNING', 'PARTIALLY_FILLED', 'CANCEL_PENDING',
+    'RECONCILE_REQUIRED', 'SELL_PENDING', 'SELL_OPEN',
+    'EXIT_REQUIRED', 'EXITING',
+  ].includes(p.status)).length;
 
   const tbody = document.getElementById('positions-body');
   if (!positions.length) {
@@ -165,7 +173,10 @@ function renderPositions(positions) {
 
   tbody.innerHTML = positions.map(p => {
     const placed = p.placed_at ? new Date(p.placed_at).toLocaleString('ru') : '—';
-    const canCancel = ['OPEN','WARNING'].includes(p.status);
+    const canCancel = [
+      'OPEN','WARNING','PARTIALLY_FILLED','CANCEL_PENDING',
+      'RECONCILE_REQUIRED','SELL_PENDING','SELL_OPEN'
+    ].includes(p.status);
     const orderUsdc = Number(p.price || 0) * Number(p.size || 0);
     const expanded = expandedConditions.has(p.condition_id);
     const history = conditionHistory[p.condition_id] || [];
@@ -558,6 +569,9 @@ function chipClassFor(status) {
     OPEN: 'chip-open', FILLED: 'chip-filled', WARNING: 'chip-warning',
     CANCELLED: 'chip-cancelled', MOVED: 'chip-moved',
     PENDING_PLACE: 'chip-warning', SELL_PENDING: 'chip-warning',
+    PARTIALLY_FILLED: 'chip-warning', CANCEL_PENDING: 'chip-warning',
+    RECONCILE_REQUIRED: 'chip-warning', EXIT_REQUIRED: 'chip-warning',
+    EXITING: 'chip-warning', EXITED: 'chip-filled',
     SELL_OPEN: 'chip-open', FAILED: 'chip-cancelled', UNKNOWN: 'chip-warning',
   }[status] || 'chip-open';
 }

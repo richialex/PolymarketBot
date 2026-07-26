@@ -28,7 +28,7 @@
         <span id="header-est-daily" class="value">—</span>
       </div>
       <div class="stat">
-        <span class="label">Вложено сейчас</span>
+        <span class="label">Номинал BUY-лимиток</span>
         <span id="header-invested" class="value">—</span>
       </div>
     </div>
@@ -60,8 +60,8 @@
             USDC на позицию
             <input id="s-order-usdc" type="number" min="0.01" step="0.01" value="10" />
           </label>
-          <label title="Сколько капитала бот может задействовать суммарно в своих BUY-позициях. Ручные открытые ордера сюда не входят.">
-            Макс. капитал бота, USDC
+          <label title="Максимальный суммарный номинал BUY-котировок. На разных рынках один wallet collateral может переиспользоваться; это не сумма заблокированных USDC.">
+            Макс. номинал BUY-котировок
             <input id="s-bot-capital-limit-usdc" type="number" min="0" step="1" value="100" />
           </label>
           <label title="Сколько худших рабочих ордеров бот может отменить за один ребаланс, если нашёл рынок заметно лучше.">
@@ -76,11 +76,12 @@
             Интервал сканирования, сек
             <input id="s-interval" type="number" min="10" step="10" value="60" />
           </label>
-          <label title="Источник первичного поиска reward-рынков. Legacy — текущий SDK-путь, Multi — новый /rewards/markets/multi.">
+          <label title="Legacy — SDK-путь. Multi — полный тяжёлый анализ списка /rewards/markets/multi. Hybrid — быстрый многоступенчатый анализ того же списка.">
             Режим поиска рынков
             <select id="s-scanner-mode">
               <option value="legacy">Legacy</option>
               <option value="multi">Multi</option>
+              <option value="hybrid">Hybrid (быстрый)</option>
             </select>
           </label>
           <label>

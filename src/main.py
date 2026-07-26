@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from src import db
 from src.bot import bot
 from src.pm_client import client
+from src.order_manager import order_manager
 from src.scanner import calc_sell_order_price, mid_from_order_book, _extract_asks
 from src.config import settings as cfg
 from src.logging_setup import configure_logging
@@ -83,11 +84,10 @@ async def get_stats():
         current_balance = 0.0
     balance_delta_24h = round(current_balance - balance_24h_ago, 4) if balance_24h_ago else None
 
-    # Real locked USDC from Polymarket (sum of active orders)
-    try:
-        locked_usdc = await asyncio.wait_for(client.get_locked_usdc(), timeout=5.0)
-    except Exception:
-        locked_usdc = pos_stats.get("invested_usdc", 0.0)
+    # Cross-market BUY quotes intentionally reuse wallet collateral.  Report
+    # quote notional separately from actually matched, unsold inventory.
+    quote_notional = await db.get_bot_quote_notional()
+    inventory_exposure = await db.get_bot_inventory_exposure()
 
     # Estimated daily earnings from open positions using last scan data
     candidate_map = {m.condition_id: m for m in bot.last_scan}
@@ -102,7 +102,9 @@ async def get_stats():
 
     return {
         **pos_stats,
-        "invested_usdc": locked_usdc,  # override with real Polymarket value
+        "invested_usdc": quote_notional,  # backward-compatible UI field
+        "quote_notional_usdc": quote_notional,
+        "inventory_exposure_usdc": inventory_exposure,
         "current_balance": round(current_balance, 4),
         "balance_delta_24h": balance_delta_24h,
         "balance_history": balance_history[-48:],  # last 48 snapshots
@@ -173,8 +175,10 @@ def _serialize_unmanaged_position(pos, uncovered_size: float) -> dict:
 
 
 async def _unmanaged_positions() -> list[dict]:
-    positions = await client.list_positions()
-    open_orders = await client.list_open_orders()
+    positions, positions_reachable = await client.list_positions_status()
+    open_orders, open_orders_reachable = await client.list_open_orders_status()
+    if not positions_reachable or not open_orders_reachable:
+        return []
     local_positions = await db.get_reconcilable_positions()
 
     covered_by_token: dict[str, float] = {}
@@ -215,36 +219,36 @@ async def _place_sell_for_unmanaged(position: dict) -> dict:
 
     local_id = f"local-sell-{uuid.uuid4().hex}"
     now = datetime.now(timezone.utc).isoformat()
-    await db.upsert_position({
-        "order_id": local_id,
-        "condition_id": position["condition_id"],
-        "market_question": position["market_question"] or position["condition_id"],
-        "token_id": token_id,
-        "outcome": position.get("outcome", ""),
-        "side": "SELL",
-        "price": sell_price,
-        "size": size,
-        "status": "SELL_PENDING",
-        "placed_at": now,
-        "filled_at": None,
-        "reward_earned": 0,
-        "local_id": local_id,
-        "source": "ADOPTED",
-    })
-
-    resp = await client.place_limit(token_id, sell_price, size, "SELL")
-    if resp is None or getattr(resp, "ok", True) is False:
-        await db.update_position_status(local_id, "FAILED")
+    resp, placed = await order_manager.place_position(
+        {
+            "order_id": local_id,
+            "condition_id": position["condition_id"],
+            "market_question": position["market_question"] or position["condition_id"],
+            "token_id": token_id,
+            "outcome": position.get("outcome", ""),
+            "side": "SELL",
+            "price": sell_price,
+            "size": size,
+            "status": "SELL_PENDING",
+            "placed_at": now,
+            "filled_at": None,
+            "matched_size": 0,
+            "reward_earned": 0,
+            "local_id": local_id,
+            "source": "ADOPTED",
+        },
+        pending_status="SELL_PENDING",
+    )
+    if (
+        resp is None
+        or bool(getattr(resp, "ambiguous", False))
+        or getattr(resp, "ok", True) is False
+    ):
         return {"ok": False, "order_id": None, "price": sell_price}
 
-    order_id = str(getattr(resp, "order_id", "") or getattr(resp, "id", ""))
+    order_id = str(placed.get("order_id") or "")
     if not order_id:
-        await db.update_position_status(local_id, "FAILED")
         return {"ok": False, "order_id": None, "price": sell_price}
-
-    post_status = str(getattr(resp, "status", "") or "").upper()
-    status = "FILLED" if post_status == "MATCHED" else "OPEN"
-    await db.replace_position_order_id(local_id, order_id, status=status)
     return {"ok": True, "order_id": order_id, "price": sell_price}
 
 
@@ -269,12 +273,19 @@ async def get_positions_history_by_condition(condition_id: str, exclude_order_id
 async def get_manual_orders():
     bot_positions = await db.get_open_positions()
     bot_order_ids = {p["order_id"] for p in bot_positions}
-    orders = await client.list_open_orders()
+    orders, reachable = await client.list_open_orders_status()
+    if not reachable:
+        return []
     return [
         _serialize_order(order)
         for order in orders
         if str(getattr(order, "id", "") or "") not in bot_order_ids
     ]
+
+
+@app.get("/api/orders/attempts")
+async def get_order_attempts(limit: int = 100):
+    return await db.get_order_attempts(limit=max(1, min(limit, 500)))
 
 
 @app.get("/api/positions/unmanaged")
@@ -328,9 +339,7 @@ async def sell_unmanaged(body: UnmanagedAction):
 
 @app.delete("/api/positions/{order_id}")
 async def cancel_position(order_id: str):
-    ok = await client.cancel_order(order_id)
-    if ok:
-        await db.update_position_status(order_id, "CANCELLED")
+    ok = await order_manager.cancel_order(order_id, reason="manual_cancel")
     return {"ok": ok}
 
 
@@ -341,10 +350,8 @@ async def ban_position_market(order_id: str):
         raise HTTPException(status_code=404, detail="Position not found")
 
     ok = True
-    if pos.get("status") in ("OPEN", "WARNING", "PENDING_PLACE", "SELL_OPEN", "SELL_PENDING"):
-        ok = await client.cancel_order(order_id)
-        if ok:
-            await db.update_position_status(order_id, "CANCELLED")
+    if pos.get("status") in db.WORKING_ORDER_STATUSES:
+        ok = await order_manager.cancel_order(order_id, reason="manual_ban")
 
     ban = await db.ban_market(
         pos["condition_id"],
@@ -370,7 +377,7 @@ async def ban_market(body: MarketBanAction):
 
 @app.delete("/api/orders/{order_id}")
 async def cancel_order(order_id: str):
-    ok = await client.cancel_order(order_id)
+    ok = await order_manager.cancel_order(order_id, reason="manual_order_cancel")
     return {"ok": ok}
 
 
@@ -381,10 +388,9 @@ async def cancel_working_positions():
     failed = []
     for pos in positions:
         order_id = pos["order_id"]
-        ok = await client.cancel_order(order_id)
+        ok = await order_manager.cancel_order(order_id, reason="cancel_working")
         if ok:
             cancelled += 1
-            await db.update_position_status(order_id, "CANCELLED")
         else:
             failed.append(order_id)
     return {"ok": not failed, "cancelled": cancelled, "failed": failed}
@@ -392,11 +398,7 @@ async def cancel_working_positions():
 
 @app.post("/api/positions/cancel_all")
 async def cancel_all_positions():
-    ok = await client.cancel_all()
-    if ok:
-        positions = await db.get_open_positions()
-        for p in positions:
-            await db.update_position_status(p["order_id"], "CANCELLED")
+    ok = await order_manager.cancel_all(reason="manual_cancel_all")
     return {"ok": ok}
 
 
@@ -512,7 +514,7 @@ async def update_settings(body: BotSettings):
     data = body.model_dump(exclude_none=True)
     if "scanner_mode" in data:
         mode = str(data["scanner_mode"] or "legacy").lower()
-        data["scanner_mode"] = mode if mode in ("legacy", "multi") else "legacy"
+        data["scanner_mode"] = mode if mode in ("legacy", "multi", "hybrid") else "legacy"
     if "order_usdc" in data:
         data["order_usdc"] = max(0.0, float(data["order_usdc"]))
     if "bot_capital_limit_usdc" in data:

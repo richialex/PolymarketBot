@@ -474,7 +474,10 @@ class MarketWsWatcher:
             return False
         if state.asset_id not in self._subscribed_assets:
             return False
-        return state.snapshot_epoch == self._connection_epoch
+        return (
+            state.snapshot_epoch == self._connection_epoch
+            and self._is_fresh_locked(state)
+        )
 
     def _apply_price_level_locked(self, state: _BookState, change: dict[str, Any]) -> None:
         price = _to_float(change.get("price"))

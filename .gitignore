@@ -21,6 +21,7 @@ build/
 
 # Test & utility scripts
 test_*.py
+!tests/test_*.py
 calc_invested.py
 cancel_extreme.py
 check_*.py

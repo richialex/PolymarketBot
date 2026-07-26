@@ -3,10 +3,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 import httpx
+from polymarket.errors import (
+    InsufficientAllowanceError,
+    InsufficientLiquidityError,
+    RateLimitError,
+    RequestRejectedError,
+    SigningError,
+    TransportError,
+    UnexpectedResponseError,
+    UserInputError,
+)
 from polymarket import (
     PublicClient, SecureClient,
     CurrentReward, MarketReward,
@@ -22,11 +33,73 @@ log = logging.getLogger(__name__)
 
 
 _CONN_ERRORS = ("connectionterminated", "connection terminated", "remoteerror",
-                "connectionreset", "broken pipe", "eof occurred")
+                "connectionreset", "broken pipe", "eof occurred",
+                "server disconnected", "handshake operation timed out",
+                "timed out", "timeout")
+
+
+@dataclass(frozen=True)
+class PlacementResult:
+    """Normalized result of the non-idempotent POST /order call."""
+
+    outcome: Literal["accepted", "rejected", "ambiguous"]
+    order_id: str = ""
+    status: str = ""
+    error_code: str = ""
+    error_message: str = ""
+    attempts: int = 1
+
+    @property
+    def ok(self) -> bool:
+        return self.outcome == "accepted"
+
+    @property
+    def ambiguous(self) -> bool:
+        return self.outcome == "ambiguous"
 
 
 def _is_conn_error(e: Exception) -> bool:
-    return any(kw in str(e).lower() for kw in _CONN_ERRORS)
+    return isinstance(e, (TransportError, httpx.TransportError, TimeoutError)) or any(
+        kw in str(e).lower() for kw in _CONN_ERRORS
+    )
+
+
+def _classify_order_error(error: Exception) -> tuple[str, str, bool]:
+    """Return error_code, message, and whether the POST outcome is ambiguous."""
+    message = str(error) or error.__class__.__name__
+    lowered = message.lower()
+
+    if _is_conn_error(error) or isinstance(error, UnexpectedResponseError):
+        return "transport_ambiguous", message, True
+    if isinstance(error, RateLimitError) or "rate limit" in lowered or "too many requests" in lowered:
+        return "rate_limited", message, False
+    if isinstance(error, InsufficientLiquidityError):
+        return "insufficient_liquidity", message, False
+    if "not enough balance" in lowered or "allowance is not enough" in lowered:
+        return "not_enough_balance", message, False
+    if isinstance(error, InsufficientAllowanceError):
+        return "insufficient_allowance", message, False
+    if "post-only" in lowered and ("cross" in lowered or "match" in lowered):
+        return "post_only_would_cross", message, False
+    if "tick size" in lowered or "minimum tick" in lowered:
+        return "invalid_tick_size", message, False
+    if "minimum" in lowered and "size" in lowered:
+        return "invalid_min_size", message, False
+    if "market is not yet ready" in lowered or "market_not_ready" in lowered:
+        return "market_not_ready", message, False
+    if "duplicated" in lowered or "duplicate" in lowered:
+        return "duplicate_order", message, False
+    if "invalid nonce" in lowered:
+        return "invalid_nonce", message, False
+    if "invalid signature" in lowered or isinstance(error, SigningError):
+        return "auth_or_signature", message, False
+    if isinstance(error, UserInputError):
+        return "invalid_request", message, False
+    if isinstance(error, RequestRejectedError):
+        return f"http_{error.status}", message, False
+    # Unknown runtime failures after starting a POST are treated
+    # conservatively: the exchange may have accepted the order.
+    return "unknown_ambiguous", message, True
 
 
 def _paginator_items(paginator: Any) -> list[Any]:
@@ -139,41 +212,41 @@ class PMClient:
         cursor: str | None = None
         seen_cursors: set[str] = set()
         seen_conditions: set[str] = set()
-        for page in range(max(1, int(max_pages))):
-            if cursor:
-                if cursor in seen_cursors:
-                    log.warning("get_reward_markets_multi repeated cursor=%s; stopping pagination", cursor)
-                    break
-                seen_cursors.add(cursor)
-                params["next_cursor"] = cursor
-            try:
-                async with httpx.AsyncClient(timeout=20, trust_env=True) as http:
+        async with httpx.AsyncClient(timeout=20, trust_env=True) as http:
+            for page in range(max(1, int(max_pages))):
+                if cursor:
+                    if cursor in seen_cursors:
+                        log.warning("get_reward_markets_multi repeated cursor=%s; stopping pagination", cursor)
+                        break
+                    seen_cursors.add(cursor)
+                    params["next_cursor"] = cursor
+                try:
                     resp = await http.get(
                         "https://clob.polymarket.com/rewards/markets/multi",
                         params=params,
                     )
                     resp.raise_for_status()
                     payload = resp.json()
-            except Exception as e:
-                log.warning("get_reward_markets_multi page=%d cursor=%s: %s", page + 1, cursor or "-", e)
-                break
+                except Exception as e:
+                    log.warning("get_reward_markets_multi page=%d cursor=%s: %s", page + 1, cursor or "-", e)
+                    break
 
-            data = payload.get("data") if isinstance(payload, dict) else None
-            if isinstance(data, list):
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    condition_id = str(item.get("condition_id") or "")
-                    if condition_id and condition_id in seen_conditions:
-                        continue
-                    if condition_id:
-                        seen_conditions.add(condition_id)
-                    out.append(item)
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if isinstance(data, list):
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        condition_id = str(item.get("condition_id") or "")
+                        if condition_id and condition_id in seen_conditions:
+                            continue
+                        if condition_id:
+                            seen_conditions.add(condition_id)
+                        out.append(item)
 
-            next_cursor = str(payload.get("next_cursor") or "") if isinstance(payload, dict) else ""
-            if not next_cursor or next_cursor == "LTE=":
-                break
-            cursor = next_cursor
+                next_cursor = str(payload.get("next_cursor") or "") if isinstance(payload, dict) else ""
+                if not next_cursor or next_cursor == "LTE=":
+                    break
+                cursor = next_cursor
         return out
 
     # ── Markets ────────────────────────────────────────────────────────────────
@@ -266,12 +339,12 @@ class PMClient:
         size: float,
         side: str,
         post_only: bool = True,
-    ) -> OrderResponse | None:
+    ) -> PlacementResult:
         loop = asyncio.get_event_loop()
-        for attempt in range(4):
+        for attempt in range(2):
             _p = price
             try:
-                return await loop.run_in_executor(
+                response: OrderResponse = await loop.run_in_executor(
                     None,
                     lambda p=_p: self._secure().place_limit_order(
                         token_id=token_id,
@@ -282,28 +355,160 @@ class PMClient:
                         builder_code=settings.builder_code.strip() or None,
                     ),
                 )
-            except Exception as e:
-                err = str(e)
-                if "tick size" in err and attempt == 0:
+                if getattr(response, "ok", False):
+                    return PlacementResult(
+                        outcome="accepted",
+                        order_id=str(getattr(response, "order_id", "") or ""),
+                        status=str(getattr(response, "status", "") or ""),
+                        attempts=attempt + 1,
+                    )
+                code = str(getattr(response, "code", "") or "rejected")
+                message = str(getattr(response, "message", "") or code)
+                if code in ("invalid_tick_size", "invalid_tick") and attempt == 0:
                     price = round(price, 2)
-                    log.info("place_limit: tick-size error, rounding %.4f → %.2f | %s", _p, price, token_id[:20])
+                    log.info(
+                        "place_limit: tick-size rejection, rounding %.4f → %.2f | %s",
+                        _p,
+                        price,
+                        token_id[:20],
+                    )
                     continue
-                if _is_conn_error(e) and attempt < 3:
-                    log.warning("place_limit connection reset, retrying (attempt %d): %s", attempt + 1, e)
+                return PlacementResult(
+                    outcome="rejected",
+                    error_code=code,
+                    error_message=message,
+                    attempts=attempt + 1,
+                )
+            except Exception as e:
+                code, message, ambiguous = _classify_order_error(e)
+                if code == "invalid_tick_size" and attempt == 0:
+                    price = round(price, 2)
+                    log.info(
+                        "place_limit: tick-size error, rounding %.4f → %.2f | %s",
+                        _p,
+                        price,
+                        token_id[:20],
+                    )
+                    continue
+                if ambiguous:
+                    # POST /order is not idempotent.  The exchange may have
+                    # accepted it before the response was lost; reconciliation
+                    # must decide whether it exists instead of posting again.
+                    log.warning(
+                        "place_limit ambiguous error code=%s; not retrying: %s",
+                        code,
+                        message,
+                    )
                     self._reset()
-                    await asyncio.sleep(1)
-                    continue
-                log.error("place_limit %s: %s", token_id, e)
-                return None
+                    return PlacementResult(
+                        outcome="ambiguous",
+                        error_code=code,
+                        error_message=message,
+                        attempts=attempt + 1,
+                    )
+                log.error("place_limit rejected token=%s code=%s: %s", token_id, code, message)
+                return PlacementResult(
+                    outcome="rejected",
+                    error_code=code,
+                    error_message=message,
+                    attempts=attempt + 1,
+                )
+        return PlacementResult(
+            outcome="rejected",
+            error_code="invalid_tick_size",
+            error_message="Tick-size correction did not produce a valid order",
+            attempts=2,
+        )
+
+    async def place_market_sell(
+        self,
+        token_id: str,
+        shares: float,
+        *,
+        min_price: float,
+    ) -> PlacementResult:
+        """Place a SELL FAK for dust that cannot satisfy the limit-order minimum.
+
+        ``min_price`` caps slippage at the observed best bid.  A market POST is
+        non-idempotent, so an ambiguous response is reconciled rather than
+        retried blindly.
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            response: OrderResponse = await loop.run_in_executor(
+                None,
+                lambda: self._secure().place_market_order(
+                    token_id=token_id,
+                    side="SELL",
+                    shares=Decimal(str(shares)),
+                    min_price=Decimal(str(min_price)),
+                    order_type="FAK",
+                    builder_code=settings.builder_code.strip() or None,
+                ),
+            )
+            if getattr(response, "ok", False):
+                return PlacementResult(
+                    outcome="accepted",
+                    order_id=str(getattr(response, "order_id", "") or ""),
+                    status=str(getattr(response, "status", "") or ""),
+                )
+            code = str(getattr(response, "code", "") or "rejected")
+            return PlacementResult(
+                outcome="rejected",
+                error_code=code,
+                error_message=str(getattr(response, "message", "") or code),
+            )
+        except Exception as e:
+            code, message, ambiguous = _classify_order_error(e)
+            if ambiguous:
+                log.warning(
+                    "place_market_sell ambiguous error code=%s; not retrying: %s",
+                    code,
+                    message,
+                )
+                self._reset()
+                return PlacementResult(
+                    outcome="ambiguous",
+                    error_code=code,
+                    error_message=message,
+                )
+            log.error(
+                "place_market_sell rejected token=%s code=%s: %s",
+                token_id,
+                code,
+                message,
+            )
+            return PlacementResult(
+                outcome="rejected",
+                error_code=code,
+                error_message=message,
+            )
 
     async def cancel_order(self, order_id: str) -> bool:
         loop = asyncio.get_event_loop()
         for attempt in range(2):
             try:
-                await loop.run_in_executor(
+                response = await loop.run_in_executor(
                     None,
                     lambda: self._secure().cancel_order(order_id=order_id),
                 )
+                canceled = getattr(response, "canceled", None)
+                not_canceled = getattr(response, "not_canceled", None)
+                if isinstance(response, dict):
+                    canceled = response.get("canceled", canceled)
+                    not_canceled = response.get("not_canceled", not_canceled)
+                if canceled is not None:
+                    ok = str(order_id) in {str(item) for item in (canceled or [])}
+                    if not ok:
+                        log.warning(
+                            "cancel_order not confirmed id=%s reason=%s",
+                            order_id,
+                            (not_canceled or {}).get(order_id, "unknown")
+                            if isinstance(not_canceled, dict)
+                            else not_canceled,
+                        )
+                    return ok
+                # Compatibility with the beta SDK's older empty response.
                 return True
             except Exception as e:
                 if _is_conn_error(e) and attempt == 0:
@@ -344,6 +549,10 @@ class PMClient:
                 return None
 
     async def list_open_orders(self) -> list[OpenOrder]:
+        orders, _reachable = await self.list_open_orders_status()
+        return orders
+
+    async def list_open_orders_status(self) -> tuple[list[OpenOrder], bool]:
         loop = asyncio.get_event_loop()
         for attempt in range(2):
             try:
@@ -351,16 +560,20 @@ class PMClient:
                     None,
                     lambda: self._secure().list_open_orders(),
                 )
-                return _paginator_items(paginator)
+                return _paginator_items(paginator), True
             except Exception as e:
                 if _is_conn_error(e) and attempt == 0:
                     log.warning("list_open_orders connection reset, retrying: %s", e)
                     self._reset()
                     continue
                 log.warning("list_open_orders: %s", e)
-                return []
+                return [], False
 
     async def list_positions(self) -> list[Any]:
+        positions, _reachable = await self.list_positions_status()
+        return positions
+
+    async def list_positions_status(self) -> tuple[list[Any], bool]:
         loop = asyncio.get_event_loop()
         for attempt in range(2):
             try:
@@ -368,17 +581,21 @@ class PMClient:
                     None,
                     lambda: self._secure().list_positions(size_threshold=0.0001, page_size=100),
                 )
-                return _paginator_items(paginator)
+                return _paginator_items(paginator), True
             except Exception as e:
                 if _is_conn_error(e) and attempt == 0:
                     log.warning("list_positions connection reset, retrying: %s", e)
                     self._reset()
                     continue
                 log.warning("list_positions: %s", e)
-                return []
+                return [], False
 
     async def get_token_position_size(self, token_id: str) -> float:
-        positions = await self.list_positions()
+        size, _reachable = await self.get_token_position_size_status(token_id)
+        return size
+
+    async def get_token_position_size_status(self, token_id: str) -> tuple[float, bool]:
+        positions, reachable = await self.list_positions_status()
         total = 0.0
         for pos in positions:
             if str(getattr(pos, "token_id", "") or "") != str(token_id):
@@ -387,7 +604,7 @@ class PMClient:
                 total += float(getattr(pos, "size", 0) or 0)
             except (TypeError, ValueError):
                 pass
-        return total
+        return total, reachable
 
     async def get_locked_usdc(self) -> float:
         """Return USDC actually locked in open BUY orders on Polymarket.

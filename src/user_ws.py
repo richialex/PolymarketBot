@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from datetime import datetime, timezone
 from typing import Any
 
 import websockets
@@ -11,6 +10,7 @@ import websockets
 from src import db
 from src.logging_setup import configure_ws_file_logger
 from src.pm_client import client
+from src.order_manager import order_manager
 
 
 USER_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
@@ -28,6 +28,7 @@ class UserWsWatcher:
         self._subscribed_markets: set[str] = set()
         self._last_message_at = 0.0
         self._last_pong_at = 0.0
+        self._connected_since = 0.0
 
     async def run(self) -> None:
         backoff = 1
@@ -132,7 +133,12 @@ class UserWsWatcher:
                 return
 
     def is_healthy(self) -> bool:
-        return self._connected and bool(self._subscribed_markets)
+        if not self._connected or not self._subscribed_markets:
+            return False
+        now = time.monotonic()
+        if self._last_pong_at:
+            return now - self._last_pong_at <= PING_INTERVAL_S * 3
+        return bool(self._connected_since and now - self._connected_since <= PING_INTERVAL_S * 3)
 
     def status(self) -> dict[str, Any]:
         now = time.monotonic()
@@ -147,8 +153,11 @@ class UserWsWatcher:
         self._connected = connected
         self._subscribed_markets = set(subscribed)
         if connected:
+            self._connected_since = time.monotonic()
             self._last_message_at = 0.0
             self._last_pong_at = 0.0
+        else:
+            self._connected_since = 0.0
 
     def _set_subscribed_markets(self, subscribed: set[str]) -> None:
         self._subscribed_markets = set(subscribed)
@@ -197,47 +206,31 @@ class UserWsWatcher:
         if not order_id:
             return
 
-        original_size = _to_float(original)
         matched_size = _to_float(matched) or 0.0
-        if matched_size > 0:
-            await db.update_position_matched_size(order_id, matched_size)
-
         local_pos = await db.get_position(order_id)
         local_side = str((local_pos or {}).get("side") or side or "").upper()
-        local_size = _to_float((local_pos or {}).get("size")) or original_size or 0.0
-        fully_matched = local_size > 0 and matched_size >= max(0.0, local_size - 0.0001)
-
-        if fully_matched or status in ("FILLED", "MATCHED"):
-            if local_side in ("BUY", "SELL"):
-                await db.update_position_status(
-                    order_id,
-                    "FILLED",
-                    filled_at=datetime.now(timezone.utc).isoformat(),
-                )
-                log.info("USER_WS filled side=%s id=%s matched=%s size=%s", local_side, _short(order_id), matched or "?", local_size)
+        local_size = _to_float((local_pos or {}).get("size")) or _to_float(original) or 0.0
+        updated = await order_manager.handle_order_update(
+            order_id=order_id,
+            matched_size=matched_size,
+            status=status,
+            order_type=order_type,
+        )
+        if updated is None:
             return
 
-        if matched_size > 0:
+        effective_matched = float(updated.get("matched_size") or matched_size)
+        if effective_matched > 0:
+            fill_kind = "filled" if local_size > 0 and effective_matched >= local_size - 0.0001 else "partial_fill"
             log.info(
-                "USER_WS partial_fill side=%s id=%s matched=%s size=%s status=%s",
+                "USER_WS %s side=%s id=%s matched=%s size=%s state=%s",
+                fill_kind,
                 local_side or "?",
                 _short(order_id),
-                matched or "?",
+                effective_matched,
                 local_size or "?",
-                status or "?",
+                updated.get("status") or "?",
             )
-
-        if order_type == "CANCELLATION" and status in ("CANCELED", "CANCELLED"):
-            if matched_size > 0:
-                await db.update_position_status(order_id, "UNKNOWN")
-                log.warning(
-                    "USER_WS partial_cancel id=%s matched=%s size=%s marked UNKNOWN for manual reconcile",
-                    _short(order_id),
-                    matched or "?",
-                    local_size or "?",
-                )
-            else:
-                await db.update_position_status(order_id, "CANCELLED")
 
     def _log_trade(self, event: dict[str, Any]) -> None:
         trade_id = str(event.get("id") or event.get("taker_order_id") or "")
