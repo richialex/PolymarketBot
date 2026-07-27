@@ -189,6 +189,29 @@ class PMClient:
                 log.warning("get_market_reward %s: %s", condition_id, e)
                 return None
 
+    async def get_reward_percentages(self) -> tuple[dict[str, float], bool]:
+        """Return this account's reward share for all markets in one request."""
+        loop = asyncio.get_event_loop()
+        for attempt in range(2):
+            try:
+                raw = await loop.run_in_executor(
+                    None, lambda: self._secure().get_reward_percentages()
+                )
+                percentages: dict[str, float] = {}
+                for condition_id, value in dict(raw or {}).items():
+                    try:
+                        percentages[str(condition_id)] = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                return percentages, True
+            except Exception as e:
+                if _is_conn_error(e) and attempt == 0:
+                    log.warning("get_reward_percentages connection reset, retrying: %s", e)
+                    self._reset()
+                    continue
+                log.warning("get_reward_percentages: %s", e)
+                return {}, False
+
     async def get_reward_markets_multi(
         self,
         *,

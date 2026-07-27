@@ -21,7 +21,7 @@ QUESTION_BLACKLIST: set[str] = {
     "russia", "russian",
 }
 PREFERRED_CATEGORIES = {"gaming", "crypto", "sports", "esports", "technology", "token"}
-FARM_MODES = ("cheap", "expensive", "both")
+FARM_MODES = ("cheap", "expensive", "both", "auto")
 BOTH_SCAN_MODES = ("cheap", "strict")
 
 # Politics-related tag variants from Polymarket API (supplement the user's category_blacklist)
@@ -64,7 +64,7 @@ class ScoredMarket:
     reward_per_dollar: float = 0.0   # Rule 3: daily reward / zone liquidity (higher = better)
     orderbook_depth: int = 0       # total bid levels (display)
     min_order_cost: float = 0.0    # total market budget needed for min_size on selected outcome(s)
-    farm_mode: str = "cheap"       # side used for token-specific filters and cost
+    farm_mode: str = "cheap"       # cheap | expensive | both | auto
     both_scan_mode: str = "cheap"  # cheap | strict, relevant only for farm_mode=both
 
 
@@ -94,6 +94,10 @@ def select_buy_token_index(tokens: list[dict], farm_mode: str = "cheap") -> int:
 def select_buy_token_indexes(tokens: list[dict], farm_mode: str = "cheap") -> tuple[int, ...]:
     """Return every outcome that must be quoted for the configured farm mode."""
     mode = normalize_farm_mode(farm_mode)
+    # Auto intentionally scans like cheap mode. Both live books are inspected
+    # only for the small set of markets that reaches the entry stage.
+    if mode == "auto":
+        return (select_buy_token_index(tokens, "cheap"),)
     if mode != "both":
         return (select_buy_token_index(tokens, mode),)
     if not tokens:

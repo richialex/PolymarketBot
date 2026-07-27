@@ -62,6 +62,7 @@
               <option value="cheap">Дешёвый исход (текущий режим)</option>
               <option value="expensive">Дорогой исход (меньше fill-риск)</option>
               <option value="both">YES + NO (одинаковые доли)</option>
+              <option value="auto">Auto Qmin (адаптивный)</option>
             </select>
           </label>
           <label id="both-scan-mode-field" title="В мягком режиме рыночные фильтры применяются к дешёвому исходу, но перед входом оба ордера всё равно проверяются на пересечение ask и наличие живого стакана.">
@@ -74,6 +75,34 @@
           <label title="Общий бюджет нового входа в один рынок. В режиме YES + NO он распределяется между двумя ордерами с одинаковым количеством долей.">
             USDC на позицию
             <input id="s-order-usdc" type="number" min="0.01" step="0.01" value="10" />
+          </label>
+          <label class="auto-setting" hidden title="Начальный общий бюджет рынка. Auto выберет дешёвую, дорогую или обе стороны по максимальному Qmin.">
+            Auto: пробный бюджет, $
+            <input id="s-auto-probe-usdc" type="number" min="0.01" step="0.01" value="15" />
+          </label>
+          <label class="auto-setting" hidden title="После двух замеров ниже этой фактической доли наград рынок будет закрыт.">
+            Auto: мин. доля наград, %
+            <input id="s-auto-min-share" type="number" min="0" step="0.01" value="0.5" />
+          </label>
+          <label class="auto-setting" hidden title="Пока доля ниже цели, бот увеличивает общий бюджет рынка шагами.">
+            Auto: целевая доля, %
+            <input id="s-auto-target-share" type="number" min="0" step="0.01" value="1" />
+          </label>
+          <label class="auto-setting" hidden>
+            Auto: шаг увеличения, $
+            <input id="s-auto-step-usdc" type="number" min="0.01" step="0.01" value="5" />
+          </label>
+          <label class="auto-setting" hidden title="Один пакетный запрос проверяет сразу все открытые Auto-рынки. Минимум 60 секунд.">
+            Auto: проверка наград, сек
+            <input id="s-auto-check-interval" type="number" min="60" step="30" value="180" />
+          </label>
+          <label class="auto-setting" hidden title="Сколько последовательных слабых замеров нужно перед выходом.">
+            Auto: подтверждений выхода
+            <input id="s-auto-confirmations" type="number" min="1" max="10" step="1" value="2" />
+          </label>
+          <label class="auto-setting" hidden title="После слабого результата этот рынок временно не рассматривается повторно.">
+            Auto: кулдаун рынка, ч
+            <input id="s-auto-cooldown-hours" type="number" min="0.02" step="0.5" value="6" />
           </label>
           <label title="Максимальный суммарный номинал BUY-котировок. На разных рынках один wallet collateral может переиспользоваться; это не сумма заблокированных USDC.">
             Макс. номинал BUY-котировок
@@ -156,6 +185,10 @@
           <label title="Частота проверки позиций в секундах. 5 = агрессивно, 30 = экономно по API">
             Проверка позиций, сек
             <input id="s-monitor-interval" type="number" min="5" max="120" step="5" value="5" />
+          </label>
+          <label title="Отменять рабочий ордер только если рынок отсутствует в кандидатах столько завершённых сканов подряд. Жёсткие проверки безопасности срабатывают сразу.">
+            Выпадение из кандидатов, сканов
+            <input id="s-candidate-drop-confirm" name="candidate_drop_confirm_scans" type="number" min="1" max="20" step="1" value="3" />
           </label>
           <label class="toggle-label" title="Отменять BUY если тонкий уровень перед ботом быстро едят. Защита от входа в очередь на исполнение.">
             Защита от подъедания стакана

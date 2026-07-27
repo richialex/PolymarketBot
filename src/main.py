@@ -450,6 +450,13 @@ class BotSettings(BaseModel):
     scanner_mode: str | None = None
     farm_mode: str | None = None
     both_scan_mode: str | None = None
+    auto_probe_usdc: float | None = None
+    auto_min_reward_share_pct: float | None = None
+    auto_target_reward_share_pct: float | None = None
+    auto_step_usdc: float | None = None
+    auto_reward_check_interval_s: int | None = None
+    auto_low_share_confirmations: int | None = None
+    auto_reject_cooldown_s: int | None = None
     min_daily_reward: float | None = None
     depth: str | None = None
     category_blacklist: list[str] | None = None
@@ -466,6 +473,7 @@ class BotSettings(BaseModel):
     market_sell_max_gap_cents: float | None = None
     max_daily_trades: int | None = None
     monitor_interval_s: int | None = None
+    candidate_drop_confirm_scans: int | None = None
     front_run_protection: bool | None = None
     front_run_bid_threshold_usd: float | None = None
     front_run_eat_pct: float | None = None
@@ -492,6 +500,13 @@ async def get_settings():
         "scanner_mode":         cfg.scanner_mode,
         "farm_mode":            cfg.farm_mode,
         "both_scan_mode":       cfg.both_scan_mode,
+        "auto_probe_usdc":      cfg.auto_probe_usdc,
+        "auto_min_reward_share_pct": cfg.auto_min_reward_share_pct,
+        "auto_target_reward_share_pct": cfg.auto_target_reward_share_pct,
+        "auto_step_usdc":       cfg.auto_step_usdc,
+        "auto_reward_check_interval_s": cfg.auto_reward_check_interval_s,
+        "auto_low_share_confirmations": cfg.auto_low_share_confirmations,
+        "auto_reject_cooldown_s": cfg.auto_reject_cooldown_s,
         "min_daily_reward":     cfg.min_daily_reward,
         "depth":                cfg.depth,
         "category_blacklist":   cfg.category_blacklist,
@@ -508,6 +523,7 @@ async def get_settings():
         "market_sell_max_gap_cents": cfg.market_sell_max_gap_cents,
         "max_daily_trades":     cfg.max_daily_trades,
         "monitor_interval_s":   cfg.monitor_interval_s,
+        "candidate_drop_confirm_scans": cfg.candidate_drop_confirm_scans,
         "front_run_protection": cfg.front_run_protection,
         "front_run_bid_threshold_usd": cfg.front_run_bid_threshold_usd,
         "front_run_eat_pct":    cfg.front_run_eat_pct,
@@ -530,12 +546,26 @@ async def update_settings(body: BotSettings):
         data["scanner_mode"] = mode if mode in ("legacy", "multi", "hybrid") else "legacy"
     if "farm_mode" in data:
         mode = str(data["farm_mode"] or "cheap").lower()
-        data["farm_mode"] = mode if mode in ("cheap", "expensive", "both") else "cheap"
+        data["farm_mode"] = mode if mode in ("cheap", "expensive", "both", "auto") else "cheap"
     if "both_scan_mode" in data:
         mode = str(data["both_scan_mode"] or "cheap").lower()
         data["both_scan_mode"] = mode if mode in ("cheap", "strict") else "cheap"
     if "order_usdc" in data:
         data["order_usdc"] = max(0.0, float(data["order_usdc"]))
+    if "auto_probe_usdc" in data:
+        data["auto_probe_usdc"] = max(0.01, float(data["auto_probe_usdc"]))
+    if "auto_min_reward_share_pct" in data:
+        data["auto_min_reward_share_pct"] = max(0.0, float(data["auto_min_reward_share_pct"]))
+    if "auto_target_reward_share_pct" in data:
+        data["auto_target_reward_share_pct"] = max(0.0, float(data["auto_target_reward_share_pct"]))
+    if "auto_step_usdc" in data:
+        data["auto_step_usdc"] = max(0.01, float(data["auto_step_usdc"]))
+    if "auto_reward_check_interval_s" in data:
+        data["auto_reward_check_interval_s"] = max(60, int(data["auto_reward_check_interval_s"]))
+    if "auto_low_share_confirmations" in data:
+        data["auto_low_share_confirmations"] = max(1, int(data["auto_low_share_confirmations"]))
+    if "auto_reject_cooldown_s" in data:
+        data["auto_reject_cooldown_s"] = max(60, int(data["auto_reject_cooldown_s"]))
     if "bot_capital_limit_usdc" in data:
         data["bot_capital_limit_usdc"] = max(0.0, float(data["bot_capital_limit_usdc"]))
     if "free_balance_buffer_pct" in data:
@@ -556,6 +586,11 @@ async def update_settings(body: BotSettings):
         data["market_sell_max_gap_cents"] = max(0.0, float(data["market_sell_max_gap_cents"]))
     if "front_run_protection" in data:
         data["front_run_protection"] = bool(data["front_run_protection"])
+    if "candidate_drop_confirm_scans" in data:
+        data["candidate_drop_confirm_scans"] = max(
+            1,
+            int(data["candidate_drop_confirm_scans"]),
+        )
     if "front_run_bid_threshold_usd" in data:
         data["front_run_bid_threshold_usd"] = max(0.0, float(data["front_run_bid_threshold_usd"]))
     if "front_run_eat_pct" in data:

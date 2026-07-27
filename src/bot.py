@@ -67,6 +67,105 @@ class _BuyPlan:
     token: dict
     target_price: float
     max_budget: float
+    reward_weight: float = 1.0
+
+
+@dataclass(frozen=True)
+class _AutoAllocation:
+    sizes: tuple[int, int]
+    score: float
+    cost: float
+    route: str
+
+
+def _reward_liquidity_score(q_one: float, q_two: float, c: float = 3.0) -> float:
+    """Polymarket's central-range Qmin for two complementary outcomes."""
+    return max(min(q_one, q_two), q_one / c, q_two / c)
+
+
+def _optimize_auto_allocation(
+    plans: list[_BuyPlan],
+    total_budget: float,
+    min_size: int,
+) -> _AutoAllocation | None:
+    """Find the cheapest maximum-Qmin route: side 1, side 2, or both.
+
+    Qmin is the maximum of three terms. Therefore its global maximum is among
+    the two single-side maxima and the allocation that balances weighted
+    liquidity across both outcomes. This keeps entry work constant-time.
+    """
+    if len(plans) != 2 or total_budget <= 0:
+        return None
+
+    prices = [max(0.0, float(plan.target_price)) for plan in plans]
+    weights = [max(0.0, float(plan.reward_weight)) for plan in plans]
+    max_sizes = [
+        math.floor(min(total_budget, max(0.0, plan.max_budget)) / price)
+        if price > 0 else 0
+        for plan, price in zip(plans, prices)
+    ]
+    candidates: set[tuple[int, int]] = set()
+    for index in range(2):
+        if max_sizes[index] >= min_size and weights[index] > 0:
+            sizes = [0, 0]
+            sizes[index] = max_sizes[index]
+            candidates.add((sizes[0], sizes[1]))
+
+    if (
+        all(size >= min_size for size in max_sizes)
+        and all(weight > 0 for weight in weights)
+        and min_size * sum(prices) <= total_budget + 1e-9
+    ):
+        # Binary-search the largest common weighted quantity q where
+        # ceil(q / weight_i) shares fit both side and total-budget caps.
+        low = 0.0
+        high = min(
+            weights[0] * max_sizes[0],
+            weights[1] * max_sizes[1],
+        )
+        balanced = [min_size, min_size]
+        for _ in range(50):
+            q = (low + high) / 2
+            sizes = [
+                max(min_size, math.ceil(q / weights[index] - 1e-12))
+                for index in range(2)
+            ]
+            cost = sum(size * price for size, price in zip(sizes, prices))
+            if (
+                cost <= total_budget + 1e-9
+                and all(sizes[index] <= max_sizes[index] for index in range(2))
+            ):
+                low = q
+                balanced = sizes
+            else:
+                high = q
+
+        # Rounding down can leave cheap residual capital. Test spending it on
+        # either side as well as the minimum-cost balanced point.
+        candidates.add((balanced[0], balanced[1]))
+        for boost_index in range(2):
+            boosted = list(balanced)
+            other_cost = boosted[1 - boost_index] * prices[1 - boost_index]
+            boosted[boost_index] = min(
+                max_sizes[boost_index],
+                math.floor(max(0.0, total_budget - other_cost) / prices[boost_index]),
+            )
+            candidates.add((boosted[0], boosted[1]))
+
+    best: _AutoAllocation | None = None
+    for sizes in candidates:
+        if any(size and size < min_size for size in sizes):
+            continue
+        cost = sum(size * price for size, price in zip(sizes, prices))
+        if cost > total_budget + 1e-9:
+            continue
+        q = [sizes[index] * weights[index] for index in range(2)]
+        score = _reward_liquidity_score(q[0], q[1])
+        route = "both" if all(sizes) else ("cheap" if sizes[0] else "expensive")
+        allocation = _AutoAllocation(sizes, score, cost, route)
+        if best is None or (score, -cost) > (best.score, -best.cost):
+            best = allocation
+    return best
 
 
 def _queue_ahead_usdc(order_book, order_price: float) -> float:
@@ -241,6 +340,10 @@ class FarmingBot:
         self._shadow_signal_count = 0
         self._shadow_would_cancel_count = 0
         self._last_active_reward_check_at: float = 0.0
+        self._last_auto_reward_check_at: float = 0.0
+        self._auto_low_share_counts: dict[str, int] = {}
+        self._scan_generation: int = 0
+        self._candidate_absence_by_condition: dict[str, tuple[int, int]] = {}
         order_manager.set_execution_callback(self._handle_execution_event)
 
         # Rotating scanner state
@@ -1112,6 +1215,7 @@ class FarmingBot:
             trade_candidates, shown_candidates = await self._rotating_scan(cfg)
             self.last_scan = trade_candidates
             self.shown_markets = shown_candidates
+            self._scan_generation += 1
             for market in trade_candidates:
                 self._remember_market_tokens(market)
             self._prune_market_token_cache()
@@ -1137,6 +1241,7 @@ class FarmingBot:
             cfg = await self._load_cfg()
 
         await self._check_active_position_rewards(cfg)
+        await self._check_auto_reward_shares(cfg)
 
         candidates = list(self.last_scan)
         if not candidates:
@@ -1153,6 +1258,13 @@ class FarmingBot:
         order_usdc = max(0.0, float(cfg["order_usdc"] or 0))
         farm_mode = normalize_farm_mode(cfg.get("farm_mode"))
         both_scan_mode = normalize_both_scan_mode(cfg.get("both_scan_mode"))
+        entry_order_usdc = (
+            min(
+                order_usdc,
+                max(0.01, float(cfg.get("auto_probe_usdc", 15.0) or 15.0)),
+            )
+            if farm_mode == "auto" else order_usdc
+        )
         quote_cap_per_market = order_usdc
         capital_limit = max(0.0, float(cfg["bot_capital_limit_usdc"] or 0))
         buffer_pct = min(100.0, max(0.0, float(cfg.get("free_balance_buffer_pct", 10.0) or 0)))
@@ -1221,7 +1333,7 @@ class FarmingBot:
                 continue
 
             ratio = market.score / avg_score if avg_score > 0 else 1.0
-            market_budget = order_usdc
+            market_budget = entry_order_usdc
             if market_budget < market.min_order_cost:
                 log.info(
                     "Skip '%s': budget $%.2f < min_cost $%.2f",
@@ -1555,9 +1667,19 @@ class FarmingBot:
         """Cancel open positions for markets that are expiring soon or dropped from candidates."""
         open_positions = await db.get_open_positions()
         if not open_positions:
+            self._candidate_absence_by_condition.clear()
             return
 
         candidate_ids = {m.condition_id for m in candidates}
+        open_condition_ids = {
+            str(position.get("condition_id") or "")
+            for position in open_positions
+        }
+        self._candidate_absence_by_condition = {
+            cid: state
+            for cid, state in self._candidate_absence_by_condition.items()
+            if cid in open_condition_ids
+        }
         now = datetime.now(timezone.utc)
         expiry_cutoff = now + timedelta(days=2)
 
@@ -1573,6 +1695,10 @@ class FarmingBot:
         min_daily      = (cfg or {}).get("min_daily_reward", 7.0)
         vol_threshold  = float((cfg or {}).get("volatility_threshold", 0.03))
         max_trades     = int((cfg or {}).get("max_daily_trades", 3))
+        drop_confirm_scans = max(
+            1,
+            int((cfg or {}).get("candidate_drop_confirm_scans", 3) or 3),
+        )
         user_wl        = [w.strip().lower() for w in (cfg or {}).get("word_blacklist", []) if w.strip()]
 
         for pos in open_positions:
@@ -1598,9 +1724,33 @@ class FarmingBot:
                     reason = f"volatility {m.price_volatility:.4f} > {vol_threshold:.3f}"
                 elif m.trade_count > max_trades:
                     reason = f"trade_count {m.trade_count} > max {max_trades}"
-            # Check if market dropped out of candidates
+            # Candidate ranking/pool rotation can flicker. Count absence only
+            # once per completed scan, never once per fast trader tick.
             if not reason and cid not in candidate_ids:
-                reason = "dropped from candidates"
+                last_generation, missing_scans = (
+                    self._candidate_absence_by_condition.get(cid, (-1, 0))
+                )
+                if last_generation != self._scan_generation:
+                    missing_scans += 1
+                    self._candidate_absence_by_condition[cid] = (
+                        self._scan_generation,
+                        missing_scans,
+                    )
+                    if missing_scans < drop_confirm_scans:
+                        log.info(
+                            "Hold %s: absent from candidates scan %d/%d | %s",
+                            order_id,
+                            missing_scans,
+                            drop_confirm_scans,
+                            pos.get("market_question", "")[:50],
+                        )
+                if missing_scans >= drop_confirm_scans:
+                    reason = (
+                        "dropped from candidates for "
+                        f"{missing_scans} consecutive scans"
+                    )
+            elif cid in candidate_ids:
+                self._candidate_absence_by_condition.pop(cid, None)
             if not reason:
                 # Check expiry for markets still in candidates
                 end_date_str = expiry_map.get(cid)
@@ -1615,6 +1765,8 @@ class FarmingBot:
                         pass
 
             if reason:
+                if not reason.startswith("dropped from candidates"):
+                    self._candidate_absence_by_condition.pop(cid, None)
                 log.info("Cancelling order %s — %s | %s", order_id, reason, pos.get("market_question", "")[:50])
                 await order_manager.cancel_order(order_id, reason=reason)
 
@@ -1676,6 +1828,224 @@ class FarmingBot:
                 cancelled = await order_manager.cancel_order(order_id, reason="reward_drop")
                 if cancelled:
                     self._level_share_breach_since.pop(order_id, None)
+
+    async def _check_auto_reward_shares(self, cfg: dict) -> None:
+        """Adapt auto positions using one account-wide reward-share request."""
+        interval_s = max(
+            60,
+            int(cfg.get("auto_reward_check_interval_s", 180) or 180),
+        )
+        now_mono = time.monotonic()
+        if now_mono - self._last_auto_reward_check_at < interval_s:
+            return
+        # Throttle the whole path, including the SQLite lookup when no Auto
+        # positions exist. Modes 1-3 therefore pay one tiny lookup per interval,
+        # not one on every trader tick.
+        self._last_auto_reward_check_at = now_mono
+
+        open_positions = await db.get_open_positions()
+        all_auto_by_condition: dict[str, list[dict]] = {}
+        now_utc = datetime.now(timezone.utc)
+        for pos in open_positions:
+            if (
+                str(pos.get("side") or "").upper() != "BUY"
+                or normalize_farm_mode(pos.get("farm_mode")) != "auto"
+            ):
+                continue
+            cid = str(pos.get("condition_id") or "")
+            if not cid:
+                continue
+            all_auto_by_condition.setdefault(cid, []).append(pos)
+
+        auto_by_condition: dict[str, list[dict]] = {}
+        for cid, positions in all_auto_by_condition.items():
+            placed_times = [
+                placed_at
+                for placed_at in (_parse_dt(pos.get("placed_at")) for pos in positions)
+                if placed_at is not None
+            ]
+            # Judge the group only after every side/replacement has survived
+            # one full reward sampling interval.
+            if not placed_times or (now_utc - max(placed_times)).total_seconds() < interval_s:
+                continue
+            auto_by_condition[cid] = positions
+
+        active_auto_ids = {
+            str(pos.get("condition_id") or "")
+            for pos in open_positions
+            if normalize_farm_mode(pos.get("farm_mode")) == "auto"
+        }
+        self._auto_low_share_counts = {
+            cid: count for cid, count in self._auto_low_share_counts.items()
+            if cid in active_auto_ids
+        }
+        if not auto_by_condition:
+            return
+
+        percentages, reachable = await client.get_reward_percentages()
+        if not reachable:
+            return
+
+        minimum = max(0.0, float(cfg.get("auto_min_reward_share_pct", 0.5) or 0))
+        target = max(
+            minimum,
+            float(cfg.get("auto_target_reward_share_pct", 1.0) or 0),
+        )
+        confirmations = max(
+            1,
+            int(cfg.get("auto_low_share_confirmations", 2) or 2),
+        )
+        cooldown_s = max(
+            60,
+            int(cfg.get("auto_reject_cooldown_s", 21600) or 21600),
+        )
+        max_market_budget = max(0.0, float(cfg.get("order_usdc", 0) or 0))
+        step_usdc = max(0.01, float(cfg.get("auto_step_usdc", 5.0) or 5.0))
+
+        balance: float | None = None
+        capital_remaining: float | None = None
+        for cid, positions in auto_by_condition.items():
+            share_pct = max(0.0, float(percentages.get(cid, 0.0) or 0))
+            current_cost = sum(
+                float(pos.get("price") or 0) * float(pos.get("size") or 0)
+                for pos in positions
+            )
+
+            if share_pct < minimum:
+                count = self._auto_low_share_counts.get(cid, 0) + 1
+                self._auto_low_share_counts[cid] = count
+                log.info(
+                    "Auto reward share %.4f%% < %.4f%% confirmation %d/%d | %s",
+                    share_pct, minimum, count, confirmations,
+                    positions[0].get("market_question", "")[:50],
+                )
+                if count < confirmations:
+                    continue
+
+                cancelled_any = False
+                for pos in positions:
+                    order_id = str(pos.get("order_id") or "")
+                    if order_id and await order_manager.cancel_order(
+                        order_id,
+                        reason="auto_low_reward_share",
+                    ):
+                        cancelled_any = True
+                        self._level_share_breach_since.pop(order_id, None)
+                if cancelled_any:
+                    await db.set_condition_retry_delay(cid, cooldown_s)
+                    self.forget_market(cid)
+                    log.info(
+                        "Auto rejected market for %.1fh after %.4f%% reward share | %s",
+                        cooldown_s / 3600, share_pct,
+                        positions[0].get("market_question", "")[:50],
+                    )
+                continue
+
+            self._auto_low_share_counts.pop(cid, None)
+            if share_pct >= target or current_cost >= max_market_budget - 0.01:
+                log.debug(
+                    "Auto keep %.4f%% reward share, quote=$%.2f | %s",
+                    share_pct, current_cost,
+                    positions[0].get("market_question", "")[:45],
+                )
+                continue
+
+            desired_cost = min(max_market_budget, current_cost + step_usdc)
+            if balance is None:
+                balance = float(await client.get_balance())
+                buffer_pct = min(
+                    100.0,
+                    max(0.0, float(cfg.get("free_balance_buffer_pct", 10.0) or 0)),
+                )
+                balance *= 1.0 - buffer_pct / 100.0
+            if capital_remaining is None:
+                capital_limit = max(
+                    0.0,
+                    float(cfg.get("bot_capital_limit_usdc", 0) or 0),
+                )
+                capital_remaining = max(
+                    0.0,
+                    capital_limit - await db.get_bot_quote_notional(),
+                )
+
+            desired_cost = min(
+                desired_cost,
+                balance,
+                current_cost + capital_remaining,
+            )
+            if current_cost <= 0 or desired_cost <= current_cost + 0.99:
+                continue
+
+            ratio = desired_cost / current_cost
+            max_level_share_enabled = bool(
+                cfg.get("target_level_share_enabled", True)
+            )
+            max_level_share = float(
+                cfg.get("max_target_level_share_pct", 50.0) or 0
+            )
+            if max_level_share_enabled and max_level_share > 0:
+                # Respect the same exact-level cap as the normal monitor. For
+                # a two-sided route, the tightest side limits the common scale
+                # factor so its weighted allocation is not distorted.
+                for pos in positions:
+                    price = float(pos.get("price") or 0)
+                    old_size = float(pos.get("size") or 0)
+                    if price <= 0 or old_size <= 0:
+                        ratio = 1.0
+                        break
+                    order_book = await self._get_order_book_ws_first(
+                        str(pos.get("token_id") or ""),
+                        "auto_top_up",
+                    )
+                    if order_book is None:
+                        ratio = 1.0
+                        break
+                    level_usdc = self._book_level_usdc(
+                        order_book,
+                        "BUY",
+                        price,
+                    )
+                    order_usdc = price * old_size
+                    external_level_usdc = (
+                        max(0.0, level_usdc - order_usdc)
+                        if level_usdc + 0.01 >= order_usdc
+                        else level_usdc
+                    )
+                    max_cost = self._max_order_cost_for_level(
+                        external_level_usdc,
+                        max_level_share,
+                    )
+                    max_size = math.floor(max_cost / price)
+                    ratio = min(ratio, max_size / old_size)
+
+            if ratio <= 1.0:
+                continue
+            replacements: list[tuple[dict, int]] = []
+            for pos in positions:
+                old_size = float(pos.get("size") or 0)
+                new_size = math.floor(old_size * ratio)
+                if new_size > old_size:
+                    replacements.append((pos, new_size))
+            if not replacements:
+                continue
+
+            added = 0.0
+            for pos, new_size in replacements:
+                old_cost = float(pos.get("price") or 0) * float(pos.get("size") or 0)
+                new_cost = float(pos.get("price") or 0) * new_size
+                if await self._replace_open_order(
+                    pos,
+                    float(pos.get("price") or 0),
+                    new_size,
+                ):
+                    added += max(0.0, new_cost - old_cost)
+            if added > 0:
+                capital_remaining = max(0.0, capital_remaining - added)
+                log.info(
+                    "Auto top-up $%.2f → $%.2f after %.4f%% reward share | %s",
+                    current_cost, current_cost + added, share_pct,
+                    positions[0].get("market_question", "")[:50],
+                )
 
     @staticmethod
     def _daily_reward_rate(market_reward: object) -> float | None:
@@ -1778,7 +2148,10 @@ class FarmingBot:
         # Guard: fetch live order book and ensure our bid is strictly below best ask.
         # post_only orders get immediately cancelled if bid >= best_ask (taker).
         live_ob = await client.get_order_book(token_id)
-        if live_ob is None and normalize_farm_mode(cfg.get("farm_mode")) == "both":
+        if (
+            live_ob is None
+            and normalize_farm_mode(cfg.get("farm_mode")) in ("both", "auto")
+        ):
             log.info(
                 "Skip '%s': live order book unavailable for %s side of pair",
                 market.question[:40],
@@ -1863,6 +2236,15 @@ class FarmingBot:
             token=token,
             target_price=target_price,
             max_budget=effective_budget,
+            reward_weight=(
+                max(
+                    0.0,
+                    (
+                        market.rewards_max_spread
+                        - abs(token_mid - target_price)
+                    ) / max(market.rewards_max_spread, 1e-9),
+                ) ** 2
+            ),
         )
 
     async def _enter_market(self, market: ScoredMarket, slot_budget: float, cfg: dict) -> float:
@@ -1891,10 +2273,22 @@ class FarmingBot:
         valid = [token for token in market.tokens if 0 < float(token["price"]) < 1]
         if not valid:
             valid = market.tokens
-        selected_indexes = select_buy_token_indexes(valid, farm_mode)
+        if farm_mode == "auto":
+            selected_indexes = tuple(sorted(
+                range(len(valid)),
+                key=lambda index: float(valid[index].get("price", 0) or 0),
+            ))
+        else:
+            selected_indexes = select_buy_token_indexes(valid, farm_mode)
         if farm_mode == "both" and len(selected_indexes) != 2:
             log.info(
                 "Skip '%s': two-sided mode requires exactly two valid outcomes",
+                market.question[:40],
+            )
+            return 0.0
+        if farm_mode == "auto" and len(selected_indexes) != 2:
+            log.info(
+                "Skip '%s': auto mode requires exactly two valid outcomes",
                 market.question[:40],
             )
             return 0.0
@@ -1917,40 +2311,58 @@ class FarmingBot:
                 return 0.0
             plans.append(plan)
 
-        # A pair uses the same share count on both outcomes. The more expensive
-        # or thinner side is therefore the limiting side.
         min_size = math.ceil(market.rewards_min_size)
-        max_sizes = [
-            math.floor(plan.max_budget / plan.target_price)
-            if plan.target_price > 0 else 0
-            for plan in plans
-        ]
-        combined_price = sum(plan.target_price for plan in plans)
-        total_budget_size = (
-            math.floor(slot_budget / combined_price)
-            if combined_price > 0 else 0
-        )
-        max_sizes.append(total_budget_size)
-        size = min(max_sizes, default=0)
-        if size < min_size:
+        if farm_mode == "auto":
+            allocation = _optimize_auto_allocation(plans, slot_budget, min_size)
+            if allocation is None:
+                log.info(
+                    "Skip '%s': no qualifying auto allocation under $%.2f",
+                    market.question[:40], slot_budget,
+                )
+                return 0.0
+            plan_sizes = list(zip(plans, allocation.sizes))
+            plan_sizes = [(plan, size) for plan, size in plan_sizes if size > 0]
             log.info(
-                "Skip '%s': equal size %d < reward minimum %d "
-                "(combined price=%.2f¢, market budget=$%.2f)",
-                market.question[:40], size, min_size,
-                combined_price * 100,
-                slot_budget,
+                "Auto route=%s Qmin=%.3f cost=$%.2f/%0.2f | %s",
+                allocation.route, allocation.score, allocation.cost, slot_budget,
+                market.question[:50],
             )
-            return 0.0
+        else:
+            # A pair uses the same share count on both outcomes. The more
+            # expensive or thinner side is therefore the limiting side.
+            max_sizes = [
+                math.floor(plan.max_budget / plan.target_price)
+                if plan.target_price > 0 else 0
+                for plan in plans
+            ]
+            combined_price = sum(plan.target_price for plan in plans)
+            total_budget_size = (
+                math.floor(slot_budget / combined_price)
+                if combined_price > 0 else 0
+            )
+            max_sizes.append(total_budget_size)
+            size = min(max_sizes, default=0)
+            if size < min_size:
+                log.info(
+                    "Skip '%s': equal size %d < reward minimum %d "
+                    "(combined price=%.2f¢, market budget=$%.2f)",
+                    market.question[:40], size, min_size,
+                    combined_price * 100,
+                    slot_budget,
+                )
+                return 0.0
+            plan_sizes = [(plan, size) for plan in plans]
 
         entry_group_id = (
-            f"pair-{uuid.uuid4().hex}" if farm_mode == "both" else None
+            f"{'auto' if farm_mode == 'auto' else 'pair'}-{uuid.uuid4().hex}"
+            if farm_mode in ("both", "auto") else None
         )
         # Place the higher-priced side first: it is normally the tighter budget
         # constraint. If the second placement fails, roll back confirmed orders.
-        plans.sort(key=lambda plan: plan.target_price, reverse=True)
+        plan_sizes.sort(key=lambda item: item[0].target_price, reverse=True)
         successful: list[dict] = []
         total_cost = 0.0
-        for plan in plans:
+        for plan, size in plan_sizes:
             token = plan.token
             order_cost = size * plan.target_price
             log.info(
@@ -2254,12 +2666,12 @@ class FarmingBot:
                     self._level_share_breach_since.pop(order_id, None)
 
                     max_cost = self._max_order_cost_for_level(external_level_usdc, max_level_share)
-                    pair_entry = (
-                        normalize_farm_mode(pos.get("farm_mode")) == "both"
+                    grouped_entry = (
+                        normalize_farm_mode(pos.get("farm_mode")) in ("both", "auto")
                         and bool(pos.get("entry_group_id"))
                     )
                     if (
-                        not pair_entry
+                        not grouped_entry
                         and target_order_usdc > order_usdc + 1.0
                         and max_cost > order_usdc + 1.0
                     ):
@@ -2587,6 +2999,13 @@ class FarmingBot:
             "scanner_mode":        s.scanner_mode,
             "farm_mode":           s.farm_mode,
             "both_scan_mode":      s.both_scan_mode,
+            "auto_probe_usdc":     s.auto_probe_usdc,
+            "auto_min_reward_share_pct": s.auto_min_reward_share_pct,
+            "auto_target_reward_share_pct": s.auto_target_reward_share_pct,
+            "auto_step_usdc":      s.auto_step_usdc,
+            "auto_reward_check_interval_s": s.auto_reward_check_interval_s,
+            "auto_low_share_confirmations": s.auto_low_share_confirmations,
+            "auto_reject_cooldown_s": s.auto_reject_cooldown_s,
             "min_daily_reward":    s.min_daily_reward,
             "depth":               s.depth,
             "category_blacklist":  s.category_blacklist,
@@ -2603,6 +3022,7 @@ class FarmingBot:
             "market_sell_policy":  s.market_sell_policy,
             "market_sell_max_gap_cents": s.market_sell_max_gap_cents,
             "monitor_interval_s":  s.monitor_interval_s,
+            "candidate_drop_confirm_scans": s.candidate_drop_confirm_scans,
             "front_run_protection": s.front_run_protection,
             "front_run_bid_threshold_usd": s.front_run_bid_threshold_usd,
             "front_run_eat_pct":   s.front_run_eat_pct,

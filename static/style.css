@@ -85,6 +85,7 @@ body { background: var(--bg); color: var(--text); font-family: var(--font); font
   display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; margin-bottom: 16px;
 }
 .settings-grid label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--text-muted); }
+.settings-grid label[hidden] { display: none; }
 .settings-grid input,
 .settings-grid select {
   background: var(--surface2); border: 1px solid var(--border); color: var(--text);
@@ -92,7 +93,8 @@ body { background: var(--bg); color: var(--text); font-family: var(--font); font
 }
 .settings-grid input:focus,
 .settings-grid select:focus { outline: 2px solid var(--accent); border-color: transparent; }
-.settings-grid input:disabled { opacity: 0.5; cursor: not-allowed; }
+.settings-grid input:disabled,
+.settings-grid select:disabled { opacity: 0.5; cursor: not-allowed; }
 .settings-grid input[type="checkbox"] {
   width: 18px; height: 18px; padding: 0; border-radius: 4px;
   accent-color: var(--accent); cursor: pointer; align-self: flex-start; margin-top: 2px;

@@ -29,8 +29,15 @@ class Settings(BaseSettings):
     max_slots_per_market: int = 2  # max worst orders cancelled in one rebalance
     scan_interval_s: int = 60
     scanner_mode: str = "legacy"    # legacy | multi | hybrid
-    farm_mode: str = "cheap"         # cheap | expensive | both
+    farm_mode: str = "cheap"         # cheap | expensive | both | auto
     both_scan_mode: str = "cheap"     # cheap | strict
+    auto_probe_usdc: float = 15.0     # initial total quote budget per market
+    auto_min_reward_share_pct: float = 0.5  # reject after confirmed readings below this
+    auto_target_reward_share_pct: float = 1.0  # grow until this actual reward share
+    auto_step_usdc: float = 5.0       # total market-budget increment per check
+    auto_reward_check_interval_s: int = 180  # one batched account request
+    auto_low_share_confirmations: int = 2
+    auto_reject_cooldown_s: int = 21600
     min_daily_reward: float = 7.0
     depth: str = "edge"            # edge | mid | first
     category_blacklist: list[str] = ["politics"]
@@ -47,6 +54,7 @@ class Settings(BaseSettings):
     market_sell_max_gap_cents: float = 4.0  # max buy-price to best-bid gap for max_gap policy
     max_daily_trades: int = 3      # max price changes per day — markets with more are skipped
     monitor_interval_s: int = 5   # seconds between position checks in monitor loop
+    candidate_drop_confirm_scans: int = 3  # consecutive completed scans before stale exit
 
     # Front-run protection: cancel BUY when thin level ahead is being eaten
     front_run_protection: bool = True

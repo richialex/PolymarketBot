@@ -434,6 +434,13 @@ async function loadSettings() {
   if (data.farm_mode)                    document.getElementById('s-farm-mode').value = data.farm_mode;
   if (data.both_scan_mode)               document.getElementById('s-both-scan-mode').value = data.both_scan_mode;
   if (data.order_usdc != null)           document.getElementById('s-order-usdc').value = data.order_usdc;
+  if (data.auto_probe_usdc != null)      document.getElementById('s-auto-probe-usdc').value = data.auto_probe_usdc;
+  if (data.auto_min_reward_share_pct != null) document.getElementById('s-auto-min-share').value = data.auto_min_reward_share_pct;
+  if (data.auto_target_reward_share_pct != null) document.getElementById('s-auto-target-share').value = data.auto_target_reward_share_pct;
+  if (data.auto_step_usdc != null)       document.getElementById('s-auto-step-usdc').value = data.auto_step_usdc;
+  if (data.auto_reward_check_interval_s != null) document.getElementById('s-auto-check-interval').value = data.auto_reward_check_interval_s;
+  if (data.auto_low_share_confirmations != null) document.getElementById('s-auto-confirmations').value = data.auto_low_share_confirmations;
+  if (data.auto_reject_cooldown_s != null) document.getElementById('s-auto-cooldown-hours').value = data.auto_reject_cooldown_s / 3600;
   if (data.bot_capital_limit_usdc != null) document.getElementById('s-bot-capital-limit-usdc').value = data.bot_capital_limit_usdc;
   if (data.max_slots_per_market != null) document.getElementById('s-max-slots-per-market').value = data.max_slots_per_market;
   if (data.min_daily_reward != null)     document.getElementById('s-min-reward').value = data.min_daily_reward;
@@ -452,6 +459,7 @@ async function loadSettings() {
   if (data.market_sell_max_gap_cents != null) document.getElementById('s-market-sell-gap').value = data.market_sell_max_gap_cents;
   if (data.max_daily_trades != null)     document.getElementById('s-max-daily-trades').value = data.max_daily_trades;
   if (data.monitor_interval_s != null)   document.getElementById('s-monitor-interval').value = data.monitor_interval_s;
+  if (data.candidate_drop_confirm_scans != null) document.getElementById('s-candidate-drop-confirm').value = data.candidate_drop_confirm_scans;
   if (data.front_run_protection != null) document.getElementById('s-front-run-protection').checked = !!data.front_run_protection;
   if (data.front_run_bid_threshold_usd != null) document.getElementById('s-front-run-bid-threshold').value = data.front_run_bid_threshold_usd;
   if (data.front_run_eat_pct != null)    document.getElementById('s-front-run-eat-pct').value = data.front_run_eat_pct;
@@ -459,7 +467,7 @@ async function loadSettings() {
   if (data.front_run_cooldown_s != null) document.getElementById('s-front-run-cooldown').value = data.front_run_cooldown_s;
   if (data.word_blacklist != null)       document.getElementById('s-word-blacklist').value = (data.word_blacklist || []).join(', ');
   updateLevelShareControls();
-  updateBothScanModeControl();
+  updateFarmModeControls();
   updateOrderBudgetLimit();
 }
 
@@ -469,9 +477,16 @@ function updateLevelShareControls() {
   document.getElementById('s-level-share-confirm').disabled = !enabled;
 }
 
-function updateBothScanModeControl() {
-  const isBoth = document.getElementById('s-farm-mode').value === 'both';
+function updateFarmModeControls() {
+  const mode = document.getElementById('s-farm-mode').value;
+  const isBoth = mode === 'both';
   document.getElementById('s-both-scan-mode').disabled = !isBoth;
+  const isAuto = mode === 'auto';
+  document.querySelectorAll('.auto-setting').forEach(field => {
+    field.hidden = !isAuto;
+    const control = field.querySelector('input, select');
+    if (control) control.disabled = !isAuto;
+  });
 }
 
 async function saveSettings() {
@@ -490,6 +505,13 @@ async function saveSettings() {
     farm_mode:            document.getElementById('s-farm-mode').value,
     both_scan_mode:       document.getElementById('s-both-scan-mode').value,
     order_usdc:           orderUsdc,
+    auto_probe_usdc:      parseFloat(document.getElementById('s-auto-probe-usdc').value),
+    auto_min_reward_share_pct: parseFloat(document.getElementById('s-auto-min-share').value),
+    auto_target_reward_share_pct: parseFloat(document.getElementById('s-auto-target-share').value),
+    auto_step_usdc:       parseFloat(document.getElementById('s-auto-step-usdc').value),
+    auto_reward_check_interval_s: parseInt(document.getElementById('s-auto-check-interval').value),
+    auto_low_share_confirmations: parseInt(document.getElementById('s-auto-confirmations').value),
+    auto_reject_cooldown_s: Math.round(parseFloat(document.getElementById('s-auto-cooldown-hours').value) * 3600),
     bot_capital_limit_usdc: parseFloat(document.getElementById('s-bot-capital-limit-usdc').value),
     max_slots_per_market: parseInt(document.getElementById('s-max-slots-per-market').value),
     min_daily_reward:     parseFloat(document.getElementById('s-min-reward').value),
@@ -508,6 +530,7 @@ async function saveSettings() {
     market_sell_max_gap_cents: parseFloat(document.getElementById('s-market-sell-gap').value),
     max_daily_trades:     parseInt(document.getElementById('s-max-daily-trades').value),
     monitor_interval_s:   parseInt(document.getElementById('s-monitor-interval').value),
+    candidate_drop_confirm_scans: parseInt(document.getElementById('s-candidate-drop-confirm').value),
     front_run_protection: document.getElementById('s-front-run-protection').checked,
     front_run_bid_threshold_usd: parseFloat(document.getElementById('s-front-run-bid-threshold').value),
     front_run_eat_pct:    parseFloat(document.getElementById('s-front-run-eat-pct').value),
@@ -531,7 +554,7 @@ async function saveSettings() {
 }
 
 document.getElementById('s-level-share-enabled').addEventListener('change', updateLevelShareControls);
-document.getElementById('s-farm-mode').addEventListener('change', updateBothScanModeControl);
+document.getElementById('s-farm-mode').addEventListener('change', updateFarmModeControls);
 
 function updateOrderBudgetLimit() {
   const input = document.getElementById('s-order-usdc');
