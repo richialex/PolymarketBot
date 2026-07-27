@@ -56,7 +56,22 @@
               <option value="first">1-я позиция (макс. награда)</option>
             </select>
           </label>
-          <label title="Фиксированный бюджет одного BUY-входа бота. Бот не откроет позицию, если это больше 90% свободного USDC или больше остатка лимита капитала.">
+          <label title="Определяет сторону только для новых входов. В двустороннем режиме бюджет общий для рынка, а количество долей YES и NO одинаковое. Уже открытые ордера не переключаются автоматически.">
+            Сторона для фарма
+            <select id="s-farm-mode" name="farm_mode">
+              <option value="cheap">Дешёвый исход (текущий режим)</option>
+              <option value="expensive">Дорогой исход (меньше fill-риск)</option>
+              <option value="both">YES + NO (одинаковые доли)</option>
+            </select>
+          </label>
+          <label id="both-scan-mode-field" title="В мягком режиме рыночные фильтры применяются к дешёвому исходу, но перед входом оба ордера всё равно проверяются на пересечение ask и наличие живого стакана.">
+            Поиск для YES + NO
+            <select id="s-both-scan-mode" name="both_scan_mode">
+              <option value="cheap">По дешёвой стороне (больше рынков)</option>
+              <option value="strict">По обеим сторонам (строго)</option>
+            </select>
+          </label>
+          <label title="Общий бюджет нового входа в один рынок. В режиме YES + NO он распределяется между двумя ордерами с одинаковым количеством долей.">
             USDC на позицию
             <input id="s-order-usdc" type="number" min="0.01" step="0.01" value="10" />
           </label>

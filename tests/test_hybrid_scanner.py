@@ -16,6 +16,8 @@ from src.scanner import (  # noqa: E402
     HybridScanner,
     MultiRewardMarket,
     RewardTokenSnapshot,
+    select_buy_token_index,
+    select_buy_token_indexes,
 )
 
 
@@ -60,6 +62,69 @@ def order_book(mid: float):
 
 
 class HybridScannerTests(unittest.IsolatedAsyncioTestCase):
+    def test_buy_token_selection_defaults_to_cheap_and_supports_expensive(self) -> None:
+        tokens = [
+            {"token_id": "yes", "outcome": "Yes", "price": 0.3},
+            {"token_id": "no", "outcome": "No", "price": 0.7},
+        ]
+
+        self.assertEqual(select_buy_token_index(tokens), 0)
+        self.assertEqual(select_buy_token_index(tokens, "expensive"), 1)
+        self.assertEqual(select_buy_token_index(tokens, "unknown"), 0)
+        self.assertEqual(select_buy_token_indexes(tokens, "both"), (0, 1))
+
+    def test_prepare_applies_budget_to_configured_side(self) -> None:
+        scanner = HybridScanner()
+        markets = [reward_market(1, min_size=20, yes_price=0.4)]
+
+        cheap, _ = scanner.prepare(
+            markets,
+            min_spread=2,
+            order_usdc=10,
+            farm_mode="cheap",
+        )
+        expensive, metrics = scanner.prepare(
+            markets,
+            min_spread=2,
+            order_usdc=10,
+            farm_mode="expensive",
+        )
+
+        self.assertEqual(cheap[0].buy_indexes, (0,))
+        self.assertEqual(expensive, [])
+        self.assertEqual(metrics["cheap_rejected_by_reason"]["over_budget"], 1)
+
+    def test_prepare_two_sided_budget_must_cover_each_minimum(self) -> None:
+        scanner = HybridScanner()
+        markets = [reward_market(1, min_size=20, yes_price=0.4)]
+
+        rejected, metrics = scanner.prepare(
+            markets,
+            min_spread=2,
+            order_usdc=10,
+            farm_mode="both",
+        )
+        accepted, _ = scanner.prepare(
+            markets,
+            min_spread=2,
+            order_usdc=20,
+            farm_mode="both",
+        )
+
+        self.assertEqual(rejected, [])
+        self.assertEqual(metrics["cheap_rejected_by_reason"]["over_budget"], 1)
+        self.assertEqual(accepted[0].buy_indexes, (0, 1))
+        self.assertEqual(accepted[0].filter_indexes, (0,))
+
+        strict, _ = scanner.prepare(
+            markets,
+            min_spread=2,
+            order_usdc=20,
+            farm_mode="both",
+            both_scan_mode="strict",
+        )
+        self.assertEqual(strict[0].filter_indexes, (0, 1))
+
     def test_prepare_rejects_candidates_without_network_calls(self) -> None:
         scanner = HybridScanner()
         markets = [

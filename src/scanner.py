@@ -21,6 +21,8 @@ QUESTION_BLACKLIST: set[str] = {
     "russia", "russian",
 }
 PREFERRED_CATEGORIES = {"gaming", "crypto", "sports", "esports", "technology", "token"}
+FARM_MODES = ("cheap", "expensive", "both")
+BOTH_SCAN_MODES = ("cheap", "strict")
 
 # Politics-related tag variants from Polymarket API (supplement the user's category_blacklist)
 POLITICS_TAG_VARIANTS: set[str] = {
@@ -61,7 +63,60 @@ class ScoredMarket:
     top4_liquidity_usd: float = 0.0  # USDC in top-4 bids+asks across all tokens
     reward_per_dollar: float = 0.0   # Rule 3: daily reward / zone liquidity (higher = better)
     orderbook_depth: int = 0       # total bid levels (display)
-    min_order_cost: float = 0.0    # cheapest token × min_size (min USDC to qualify for rewards)
+    min_order_cost: float = 0.0    # total market budget needed for min_size on selected outcome(s)
+    farm_mode: str = "cheap"       # side used for token-specific filters and cost
+    both_scan_mode: str = "cheap"  # cheap | strict, relevant only for farm_mode=both
+
+
+def normalize_farm_mode(value: object) -> str:
+    mode = str(value or "cheap").strip().lower()
+    return mode if mode in FARM_MODES else "cheap"
+
+
+def normalize_both_scan_mode(value: object) -> str:
+    mode = str(value or "cheap").strip().lower()
+    return mode if mode in BOTH_SCAN_MODES else "cheap"
+
+
+def select_buy_token_index(tokens: list[dict], farm_mode: str = "cheap") -> int:
+    """Select the configured outcome using the same rule in scan and placement."""
+    if not tokens:
+        raise ValueError("Cannot select a buy token from an empty list")
+    valid_indexes = [
+        index for index, token in enumerate(tokens)
+        if 0 < float(token.get("price", 0) or 0) < 1
+    ]
+    indexes = valid_indexes or list(range(len(tokens)))
+    chooser = max if normalize_farm_mode(farm_mode) == "expensive" else min
+    return chooser(indexes, key=lambda index: float(tokens[index].get("price", 0) or 0))
+
+
+def select_buy_token_indexes(tokens: list[dict], farm_mode: str = "cheap") -> tuple[int, ...]:
+    """Return every outcome that must be quoted for the configured farm mode."""
+    mode = normalize_farm_mode(farm_mode)
+    if mode != "both":
+        return (select_buy_token_index(tokens, mode),)
+    if not tokens:
+        raise ValueError("Cannot select buy tokens from an empty list")
+    valid_indexes = tuple(
+        index for index, token in enumerate(tokens)
+        if 0 < float(token.get("price", 0) or 0) < 1
+    )
+    return valid_indexes or tuple(range(len(tokens)))
+
+
+def select_filter_token_indexes(
+    tokens: list[dict],
+    farm_mode: str = "cheap",
+    both_scan_mode: str = "cheap",
+) -> tuple[int, ...]:
+    """Return outcomes used by scanner/live book quality filters."""
+    if (
+        normalize_farm_mode(farm_mode) == "both"
+        and normalize_both_scan_mode(both_scan_mode) == "cheap"
+    ):
+        return (select_buy_token_index(tokens, "cheap"),)
+    return select_buy_token_indexes(tokens, farm_mode)
 
 
 @dataclass(frozen=True)
@@ -97,14 +152,17 @@ class _PreparedHybridMarket:
     market_slug: str
     event_slug: str
     token_list: list[dict]
-    buy_idx: int
+    buy_indexes: tuple[int, ...]
     end_date_str: str | None
+    farm_mode: str
+    both_scan_mode: str
+    filter_indexes: tuple[int, ...]
 
 
 @dataclass
 class _HybridBookCandidate:
     prepared: _PreparedHybridMarket
-    buy_order_book: Any
+    buy_order_books: dict[int, Any]
     provisional_score: float
 
 
@@ -141,9 +199,13 @@ class HybridScanner:
         *,
         min_spread: float,
         order_usdc: float,
+        farm_mode: str = "cheap",
+        both_scan_mode: str = "cheap",
         word_blacklist: list[str] | None = None,
     ) -> tuple[list[_PreparedHybridMarket], dict[str, Any]]:
         """Apply filters that need no network calls."""
+        farm_mode = normalize_farm_mode(farm_mode)
+        both_scan_mode = normalize_both_scan_mode(both_scan_mode)
         started = time.monotonic()
         prepared: list[_PreparedHybridMarket] = []
         rejected = {
@@ -215,15 +277,21 @@ class HybridScanner:
                 rejected["ending_soon"] += 1
                 continue
 
-            valid_indexes = [
-                index for index, token in enumerate(token_list)
-                if 0 < float(token["price"]) < 1
-            ]
-            buy_idx = min(
-                valid_indexes or range(len(token_list)),
-                key=lambda index: float(token_list[index]["price"]),
+            buy_indexes = select_buy_token_indexes(token_list, farm_mode)
+            if farm_mode == "both" and len(buy_indexes) != 2:
+                rejected["no_tokens"] += 1
+                continue
+            filter_indexes = select_filter_token_indexes(
+                token_list,
+                farm_mode,
+                both_scan_mode,
             )
-            min_order_cost = min_size * float(token_list[buy_idx]["price"])
+            min_order_cost = (
+                min_size * sum(
+                    float(token_list[index]["price"])
+                    for index in buy_indexes
+                )
+            )
             if order_usdc > 0 and min_order_cost > order_usdc + 1e-9:
                 rejected["over_budget"] += 1
                 continue
@@ -241,8 +309,11 @@ class HybridScanner:
                 market_slug=str(getattr(reward, "market_slug", "") or ""),
                 event_slug=str(getattr(reward, "event_slug", "") or ""),
                 token_list=token_list,
-                buy_idx=buy_idx,
+                buy_indexes=buy_indexes,
                 end_date_str=end_date_str,
+                farm_mode=farm_mode,
+                both_scan_mode=both_scan_mode,
+                filter_indexes=filter_indexes,
             ))
 
         return prepared, {
@@ -300,48 +371,74 @@ class HybridScanner:
                 self._prune_cache(cache)
             return value
 
-        async def load_buy_book(prepared: _PreparedHybridMarket):
-            token_id = prepared.token_list[prepared.buy_idx]["token_id"]
-            return await fetch_cached(
-                self._book_cache,
-                token_id,
-                self._book_cache_ttl_s,
-                "book_requests",
-                "book_cache_hits",
-                lambda: client.get_order_book(token_id),
+        async def load_buy_books(prepared: _PreparedHybridMarket):
+            async def load(index: int):
+                token_id = prepared.token_list[index]["token_id"]
+                return await fetch_cached(
+                    self._book_cache,
+                    token_id,
+                    self._book_cache_ttl_s,
+                    "book_requests",
+                    "book_cache_hits",
+                    lambda: client.get_order_book(token_id),
+                )
+
+            results = await asyncio.gather(
+                *(load(index) for index in prepared.filter_indexes),
+                return_exceptions=True,
             )
+            return {
+                index: result
+                for index, result in zip(prepared.filter_indexes, results)
+                if not isinstance(result, BaseException) and result is not None
+            }
 
         buy_books = await asyncio.gather(
-            *(load_buy_book(candidate) for candidate in candidates),
+            *(load_buy_books(candidate) for candidate in candidates),
             return_exceptions=True,
         )
 
         book_candidates: list[_HybridBookCandidate] = []
         for prepared, result in zip(candidates, buy_books):
-            if isinstance(result, BaseException) or result is None:
+            if (
+                isinstance(result, BaseException)
+                or len(result) != len(prepared.filter_indexes)
+            ):
                 continue
-            buy_ob = result
-            spread = _ob_spread_cents(buy_ob)
-            if spread is not None and spread > max_ob_spread:
-                continue
-            bids = _extract_bids(buy_ob)
-            depth_spread = bid_depth_spread_cents(bids)
-            if depth_spread is not None and depth_spread > max_bid_depth_spread:
-                continue
-            buy_mid = mid_from_order_book(buy_ob) or float(
-                prepared.token_list[prepared.buy_idx]["price"]
-            )
-            buy_zone_liquidity = _zone_liquidity_usd(
-                buy_ob,
-                buy_mid,
-                prepared.max_spread,
-            )
-            if buy_zone_liquidity <= 0:
+            selected_liquidity = 0.0
+            books_valid = True
+            for index in prepared.filter_indexes:
+                buy_ob = result[index]
+                spread = _ob_spread_cents(buy_ob)
+                bids = _extract_bids(buy_ob)
+                depth_spread = bid_depth_spread_cents(bids)
+                if (
+                    (spread is not None and spread > max_ob_spread)
+                    or (
+                        depth_spread is not None
+                        and depth_spread > max_bid_depth_spread
+                    )
+                ):
+                    books_valid = False
+                    break
+                buy_mid = mid_from_order_book(buy_ob) or float(
+                    prepared.token_list[index]["price"]
+                )
+                liquidity = _zone_liquidity_usd(
+                    buy_ob,
+                    buy_mid,
+                    prepared.max_spread,
+                )
+                if liquidity <= 0:
+                    books_valid = False
+                    break
+                selected_liquidity += liquidity
+            if not books_valid:
                 continue
             book_candidates.append(_HybridBookCandidate(
                 prepared=prepared,
-                buy_order_book=buy_ob,
-                provisional_score=prepared.daily / buy_zone_liquidity,
+                buy_order_books=result,
+                provisional_score=prepared.daily / selected_liquidity,
             ))
 
         book_candidates.sort(key=lambda item: item.provisional_score, reverse=True)
@@ -387,7 +484,7 @@ class HybridScanner:
 
             remaining_indexes = [
                 index for index in range(len(token_list))
-                if index != prepared.buy_idx
+                if index not in prepared.filter_indexes
             ]
 
             async def load_other_book(index: int):
@@ -410,7 +507,8 @@ class HybridScanner:
             history, market = await asyncio.gather(history_task, metadata_task)
 
             all_obs: list[Any] = [None] * len(token_list)
-            all_obs[prepared.buy_idx] = item.buy_order_book
+            for index, order_book in item.buy_order_books.items():
+                all_obs[index] = order_book
             for index, result in zip(remaining_indexes, other_books):
                 if not isinstance(result, BaseException):
                     all_obs[index] = result
@@ -472,7 +570,12 @@ class HybridScanner:
             reward_per_dollar = prepared.daily / top4_liq
             activity_factor = 1.0 / (trade_count / 10.0 + 1.0)
             score = reward_per_dollar * activity_factor
-            buy_price = float(token_list[prepared.buy_idx]["price"])
+            min_order_cost = (
+                prepared.min_size * sum(
+                    float(token_list[index]["price"])
+                    for index in prepared.buy_indexes
+                )
+            )
 
             return ScoredMarket(
                 condition_id=str(getattr(prepared.reward, "condition_id", "") or ""),
@@ -494,7 +597,9 @@ class HybridScanner:
                 top4_liquidity_usd=round(top4_liq, 2),
                 reward_per_dollar=round(reward_per_dollar, 6),
                 orderbook_depth=total_depth,
-                min_order_cost=round(prepared.min_size * buy_price, 2),
+                min_order_cost=round(min_order_cost, 2),
+                farm_mode=prepared.farm_mode,
+                both_scan_mode=prepared.both_scan_mode,
             )
 
         deep_results = await asyncio.gather(
@@ -588,6 +693,8 @@ async def scan_markets(
     category_blacklist: list[str] | None = None,
     volatility_threshold: float = 0.03,
     min_spread: float = 4.0,
+    farm_mode: str = "cheap",
+    both_scan_mode: str = "cheap",
 ) -> list[ScoredMarket]:
     """Legacy one-shot scan (used by /api/markets/refresh). Uses rotating logic internally."""
     all_rewards = await client.get_all_rewards()
@@ -601,7 +708,8 @@ async def scan_markets(
     return await enrich_batch(
         batch, category_blacklist=category_blacklist,
         volatility_threshold=volatility_threshold, min_spread=min_spread,
-        max_markets=max_markets,
+        max_markets=max_markets, farm_mode=farm_mode,
+        both_scan_mode=both_scan_mode,
     )
 
 
@@ -615,6 +723,8 @@ async def enrich_batch(
     max_daily_trades: int = 3,
     max_bid_depth_spread: float = 4.0,
     market_rewards: list | None = None,
+    farm_mode: str = "cheap",
+    both_scan_mode: str = "cheap",
 ) -> list[ScoredMarket]:
     """Enrich a pre-selected list of CurrentReward objects → ScoredMarket list."""
     blacklist = {c.lower() for c in (category_blacklist or [])} | BLACKLISTED_CATEGORIES
@@ -693,29 +803,41 @@ async def enrich_batch(
                 top4_liq += _zone_liquidity_usd(ob, token_mid, max_spread)
 
             # Hard filters on the token we will actually BUY.
-            valid_buy_indexes = [
-                i for i, t in enumerate(token_list)
-                if 0 < float(t["price"]) < 1
-            ]
-            buy_idx = min(valid_buy_indexes or range(len(token_list)), key=lambda i: float(token_list[i]["price"]))
-            buy_ob = all_obs[buy_idx] if buy_idx < len(all_obs) else all_obs[0] if all_obs else None
-            buy_token_id = token_list[buy_idx]["token_id"]
-
-            ob_spread = _ob_spread_cents(buy_ob)
-            if ob_spread is not None and ob_spread > max_ob_spread:
-                log.debug(
-                    "Skip %s: bid-ask spread %.1f¢ > max %.1f¢ (on buy token)",
-                    question[:40], ob_spread, max_ob_spread,
-                )
+            buy_indexes = select_buy_token_indexes(token_list, farm_mode)
+            if normalize_farm_mode(farm_mode) == "both" and len(buy_indexes) != 2:
                 continue
-
-            # Hard filter: bid depth too thin on the token we will actually BUY.
-            depth_spread = bid_depth_spread_cents(all_bids_map.get(buy_token_id, []))
-            if depth_spread is not None and depth_spread > max_bid_depth_spread:
-                log.debug(
-                    "Skip %s: bid depth spread %.1f¢ > max %.1f¢ (on buy token)",
-                    question[:40], depth_spread, max_bid_depth_spread,
+            filter_indexes = select_filter_token_indexes(
+                token_list,
+                farm_mode,
+                both_scan_mode,
+            )
+            selected_books_valid = True
+            for buy_idx in filter_indexes:
+                buy_ob = (
+                    all_obs[buy_idx]
+                    if buy_idx < len(all_obs)
+                    else None
                 )
+                buy_token_id = token_list[buy_idx]["token_id"]
+                ob_spread = _ob_spread_cents(buy_ob)
+                if ob_spread is not None and ob_spread > max_ob_spread:
+                    log.debug(
+                        "Skip %s: bid-ask spread %.1f¢ > max %.1f¢ (on selected token)",
+                        question[:40], ob_spread, max_ob_spread,
+                    )
+                    selected_books_valid = False
+                    break
+                depth_spread = bid_depth_spread_cents(
+                    all_bids_map.get(buy_token_id, [])
+                )
+                if depth_spread is not None and depth_spread > max_bid_depth_spread:
+                    log.debug(
+                        "Skip %s: bid depth spread %.1f¢ > max %.1f¢ (on selected token)",
+                        question[:40], depth_spread, max_bid_depth_spread,
+                    )
+                    selected_books_valid = False
+                    break
+            if not selected_books_valid:
                 continue
 
             # Hard filter: too volatile → skip regardless of competition
@@ -810,11 +932,13 @@ async def enrich_batch(
             )
 
             # Min order cost for the token the bot will buy.
-            buy_price = min(
-                (float(t["price"]) for t in token_list if 0 < float(t["price"]) < 1),
-                default=mid_price,
+            min_order_cost = round(
+                min_size * sum(
+                    float(token_list[index]["price"])
+                    for index in buy_indexes
+                ),
+                2,
             )
-            min_order_cost = round(min_size * buy_price, 2)
 
             scored.append(ScoredMarket(
                 condition_id=reward.condition_id,
@@ -837,6 +961,8 @@ async def enrich_batch(
                 reward_per_dollar=round(reward_per_dollar, 6),
                 orderbook_depth=total_depth,
                 min_order_cost=min_order_cost,
+                farm_mode=normalize_farm_mode(farm_mode),
+                both_scan_mode=normalize_both_scan_mode(both_scan_mode),
             ))
 
         except Exception as e:

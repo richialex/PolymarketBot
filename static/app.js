@@ -431,6 +431,8 @@ async function loadSettings() {
   const data = await get('/api/settings');
   if (!data) return;
   if (data.depth)                        document.getElementById('s-depth').value = data.depth;
+  if (data.farm_mode)                    document.getElementById('s-farm-mode').value = data.farm_mode;
+  if (data.both_scan_mode)               document.getElementById('s-both-scan-mode').value = data.both_scan_mode;
   if (data.order_usdc != null)           document.getElementById('s-order-usdc').value = data.order_usdc;
   if (data.bot_capital_limit_usdc != null) document.getElementById('s-bot-capital-limit-usdc').value = data.bot_capital_limit_usdc;
   if (data.max_slots_per_market != null) document.getElementById('s-max-slots-per-market').value = data.max_slots_per_market;
@@ -457,6 +459,7 @@ async function loadSettings() {
   if (data.front_run_cooldown_s != null) document.getElementById('s-front-run-cooldown').value = data.front_run_cooldown_s;
   if (data.word_blacklist != null)       document.getElementById('s-word-blacklist').value = (data.word_blacklist || []).join(', ');
   updateLevelShareControls();
+  updateBothScanModeControl();
   updateOrderBudgetLimit();
 }
 
@@ -464,6 +467,11 @@ function updateLevelShareControls() {
   const enabled = document.getElementById('s-level-share-enabled').checked;
   document.getElementById('s-max-level-share').disabled = !enabled;
   document.getElementById('s-level-share-confirm').disabled = !enabled;
+}
+
+function updateBothScanModeControl() {
+  const isBoth = document.getElementById('s-farm-mode').value === 'both';
+  document.getElementById('s-both-scan-mode').disabled = !isBoth;
 }
 
 async function saveSettings() {
@@ -479,6 +487,8 @@ async function saveSettings() {
   const wordList = rawWords.split(',').map(w => w.trim().toLowerCase()).filter(w => w.length > 0);
   const body = {
     depth:                document.getElementById('s-depth').value,
+    farm_mode:            document.getElementById('s-farm-mode').value,
+    both_scan_mode:       document.getElementById('s-both-scan-mode').value,
     order_usdc:           orderUsdc,
     bot_capital_limit_usdc: parseFloat(document.getElementById('s-bot-capital-limit-usdc').value),
     max_slots_per_market: parseInt(document.getElementById('s-max-slots-per-market').value),
@@ -521,6 +531,7 @@ async function saveSettings() {
 }
 
 document.getElementById('s-level-share-enabled').addEventListener('change', updateLevelShareControls);
+document.getElementById('s-farm-mode').addEventListener('change', updateBothScanModeControl);
 
 function updateOrderBudgetLimit() {
   const input = document.getElementById('s-order-usdc');

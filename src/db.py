@@ -38,7 +38,9 @@ CREATE TABLE IF NOT EXISTS positions (
     reward_earned  REAL NOT NULL DEFAULT 0,
     parent_order_id TEXT,
     local_id       TEXT,
-    source         TEXT NOT NULL DEFAULT 'BOT'
+    source         TEXT NOT NULL DEFAULT 'BOT',
+    farm_mode      TEXT NOT NULL DEFAULT '',
+    entry_group_id TEXT
 )
 """
 
@@ -115,6 +117,8 @@ async def init_db() -> None:
         await _ensure_column(db, "positions", "local_id", "TEXT")
         await _ensure_column(db, "positions", "source", "TEXT NOT NULL DEFAULT 'BOT'")
         await _ensure_column(db, "positions", "matched_size", "REAL NOT NULL DEFAULT 0")
+        await _ensure_column(db, "positions", "farm_mode", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "positions", "entry_group_id", "TEXT")
         await db.execute(_CREATE_SETTINGS)
         await db.execute(_CREATE_BALANCE_SNAPSHOTS)
         await db.execute(_CREATE_MARKET_BANS)
@@ -140,6 +144,9 @@ async def init_db() -> None:
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_positions_parent ON positions(parent_order_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_positions_entry_group ON positions(entry_group_id)"
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_order_fills_order ON order_fills(order_id)"
@@ -185,10 +192,10 @@ async def upsert_position(pos: dict) -> None:
             """INSERT INTO positions
                (order_id, condition_id, market_question, token_id, outcome, side,
                 price, size, status, placed_at, filled_at, matched_size, reward_earned,
-                parent_order_id, local_id, source)
+                parent_order_id, local_id, source, farm_mode, entry_group_id)
                VALUES (:order_id,:condition_id,:market_question,:token_id,:outcome,:side,
                        :price,:size,:status,:placed_at,:filled_at,:matched_size,:reward_earned,
-                       :parent_order_id,:local_id,:source)
+                       :parent_order_id,:local_id,:source,:farm_mode,:entry_group_id)
                ON CONFLICT(order_id) DO UPDATE SET
                  outcome=excluded.outcome,
                  status=excluded.status,
@@ -197,7 +204,9 @@ async def upsert_position(pos: dict) -> None:
                  reward_earned=excluded.reward_earned,
                  parent_order_id=excluded.parent_order_id,
                  local_id=excluded.local_id,
-                 source=excluded.source""",
+                 source=excluded.source,
+                 farm_mode=excluded.farm_mode,
+                 entry_group_id=excluded.entry_group_id""",
             {
                 "order_id": pos["order_id"],
                 "condition_id": pos["condition_id"],
@@ -215,6 +224,8 @@ async def upsert_position(pos: dict) -> None:
                 "parent_order_id": pos.get("parent_order_id"),
                 "local_id": pos.get("local_id"),
                 "source": pos.get("source", "BOT"),
+                "farm_mode": pos.get("farm_mode", ""),
+                "entry_group_id": pos.get("entry_group_id"),
             },
         )
         await db.commit()

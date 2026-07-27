@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     http_proxy: str  = Field(default="", alias="HTTP_PROXY")
 
     # Farming defaults (persisted in DB, overridden by UI)
-    order_usdc: float = 10.0       # fixed USDC budget for one bot entry
+    order_usdc: float = 10.0       # total USDC budget for one market entry
     bot_capital_limit_usdc: float = 100.0  # max bot-managed BUY exposure
     free_balance_buffer_pct: float = 10.0  # keep this % of free USDC unused
     slot_pct: float = 25.0         # legacy: no longer used by the capital model
@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     max_slots_per_market: int = 2  # max worst orders cancelled in one rebalance
     scan_interval_s: int = 60
     scanner_mode: str = "legacy"    # legacy | multi | hybrid
+    farm_mode: str = "cheap"         # cheap | expensive | both
+    both_scan_mode: str = "cheap"     # cheap | strict
     min_daily_reward: float = 7.0
     depth: str = "edge"            # edge | mid | first
     category_blacklist: list[str] = ["politics"]

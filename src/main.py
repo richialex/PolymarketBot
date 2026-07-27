@@ -448,6 +448,8 @@ class BotSettings(BaseModel):
     max_slots_per_market: int | None = None
     scan_interval_s: int | None = None
     scanner_mode: str | None = None
+    farm_mode: str | None = None
+    both_scan_mode: str | None = None
     min_daily_reward: float | None = None
     depth: str | None = None
     category_blacklist: list[str] | None = None
@@ -488,6 +490,8 @@ async def get_settings():
         "max_slots_per_market": cfg.max_slots_per_market,
         "scan_interval_s":      cfg.scan_interval_s,
         "scanner_mode":         cfg.scanner_mode,
+        "farm_mode":            cfg.farm_mode,
+        "both_scan_mode":       cfg.both_scan_mode,
         "min_daily_reward":     cfg.min_daily_reward,
         "depth":                cfg.depth,
         "category_blacklist":   cfg.category_blacklist,
@@ -524,6 +528,12 @@ async def update_settings(body: BotSettings):
     if "scanner_mode" in data:
         mode = str(data["scanner_mode"] or "legacy").lower()
         data["scanner_mode"] = mode if mode in ("legacy", "multi", "hybrid") else "legacy"
+    if "farm_mode" in data:
+        mode = str(data["farm_mode"] or "cheap").lower()
+        data["farm_mode"] = mode if mode in ("cheap", "expensive", "both") else "cheap"
+    if "both_scan_mode" in data:
+        mode = str(data["both_scan_mode"] or "cheap").lower()
+        data["both_scan_mode"] = mode if mode in ("cheap", "strict") else "cheap"
     if "order_usdc" in data:
         data["order_usdc"] = max(0.0, float(data["order_usdc"]))
     if "bot_capital_limit_usdc" in data:

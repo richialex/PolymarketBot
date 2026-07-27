@@ -16,7 +16,8 @@ from src.scanner import (
     calc_order_price, calc_sell_order_price,
     mid_from_order_book,
     _extract_bids, _extract_asks, _ob_spread_cents, bid_depth_spread_cents,
-    multi_reward_from_api, ScoredMarket,
+    multi_reward_from_api, normalize_farm_mode, normalize_both_scan_mode,
+    select_buy_token_indexes, select_filter_token_indexes, ScoredMarket,
 )
 from src.logging_setup import configure_shadow_file_logger
 from src.market_ws import MarketSignalSnapshot, MarketWsWatcher
@@ -59,6 +60,13 @@ class _ComplementShadowWatch:
     outcome: str
     order_price: float
     market_question: str
+
+
+@dataclass(frozen=True)
+class _BuyPlan:
+    token: dict
+    target_price: float
+    max_budget: float
 
 
 def _queue_ahead_usdc(order_book, order_price: float) -> float:
@@ -240,6 +248,8 @@ class FarmingBot:
         self._rewards_cache_time: datetime | None = None
         self._rewards_cache_min_daily: float | None = None  # min_daily used when cache was built
         self._rewards_cache_scanner_mode: str | None = None
+        self._candidate_pool_farm_mode: str = "cheap"
+        self._candidate_pool_both_scan_mode: str = "cheap"
         self._scan_cursor: int = 0
         self._candidates_pool: dict[str, ScoredMarket] = {}  # best seen across all ticks
         self._hybrid_scanner = HybridScanner()
@@ -302,10 +312,55 @@ class FarmingBot:
 
     def update_runtime_settings(self, values: dict) -> None:
         """Apply an already-persisted settings update to the read-only RAM snapshot."""
+        current = self._runtime_cfg or {}
+        if "farm_mode" in values or "both_scan_mode" in values:
+            self._handle_farm_mode_change(
+                values.get("farm_mode", current.get("farm_mode", self._candidate_pool_farm_mode)),
+                values.get(
+                    "both_scan_mode",
+                    current.get("both_scan_mode", self._candidate_pool_both_scan_mode),
+                ),
+            )
         if self._runtime_cfg is None:
             return
         self._runtime_cfg = {**self._runtime_cfg, **values}
         self._runtime_cfg_updated_at = time.monotonic()
+
+    def _handle_farm_mode_change(
+        self,
+        farm_mode: object,
+        both_scan_mode: object = "cheap",
+    ) -> None:
+        mode = normalize_farm_mode(farm_mode)
+        scan_mode = normalize_both_scan_mode(both_scan_mode)
+        if (
+            mode == self._candidate_pool_farm_mode
+            and scan_mode == self._candidate_pool_both_scan_mode
+        ):
+            return
+        log.info(
+            "Farm strategy changed %s/%s -> %s/%s, restarting candidate rotation",
+            self._candidate_pool_farm_mode,
+            self._candidate_pool_both_scan_mode,
+            mode,
+            scan_mode,
+        )
+        self._candidate_pool_farm_mode = mode
+        self._candidate_pool_both_scan_mode = scan_mode
+        self._scan_cursor = 0
+
+    @staticmethod
+    def _candidate_matches_farm_strategy(
+        market: ScoredMarket,
+        farm_mode: str,
+        both_scan_mode: str,
+    ) -> bool:
+        if normalize_farm_mode(market.farm_mode) != farm_mode:
+            return False
+        return (
+            farm_mode != "both"
+            or normalize_both_scan_mode(market.both_scan_mode) == both_scan_mode
+        )
 
     def invalidate_active_positions_cache(self) -> None:
         """Force one SQLite refresh after a critical order lifecycle change."""
@@ -1096,13 +1151,19 @@ class FarmingBot:
         await db.record_balance(free_balance)
 
         order_usdc = max(0.0, float(cfg["order_usdc"] or 0))
+        farm_mode = normalize_farm_mode(cfg.get("farm_mode"))
+        both_scan_mode = normalize_both_scan_mode(cfg.get("both_scan_mode"))
+        quote_cap_per_market = order_usdc
         capital_limit = max(0.0, float(cfg["bot_capital_limit_usdc"] or 0))
         buffer_pct = min(100.0, max(0.0, float(cfg.get("free_balance_buffer_pct", 10.0) or 0)))
         free_order_cap = max(0.0, free_balance * (1.0 - buffer_pct / 100.0))
         quote_notional = await db.get_bot_quote_notional()
         inventory_exposure = await db.get_bot_inventory_exposure()
         capital_remaining = max(0.0, capital_limit - quote_notional)
-        slots_remaining = math.floor(capital_remaining / order_usdc) if order_usdc > 0 else 0
+        slots_remaining = (
+            math.floor(capital_remaining / quote_cap_per_market)
+            if quote_cap_per_market > 0 else 0
+        )
         max_slots_per_market = cfg["max_slots_per_market"]
 
         log.info(
@@ -1128,7 +1189,10 @@ class FarmingBot:
         quote_notional = await db.get_bot_quote_notional()
         inventory_exposure = await db.get_bot_inventory_exposure()
         capital_remaining = max(0.0, capital_limit - quote_notional)
-        slots_remaining = math.floor(capital_remaining / order_usdc) if order_usdc > 0 else 0
+        slots_remaining = (
+            math.floor(capital_remaining / quote_cap_per_market)
+            if quote_cap_per_market > 0 else 0
+        )
 
         # Average score for super-deal detection
         avg_score = (sum(m.score for m in candidates) / len(candidates)) if candidates else 0
@@ -1149,6 +1213,12 @@ class FarmingBot:
             if market.condition_id in banned_conditions:
                 self._candidates_pool.pop(market.condition_id, None)
                 continue
+            if not self._candidate_matches_farm_strategy(
+                market,
+                farm_mode,
+                both_scan_mode,
+            ):
+                continue
 
             ratio = market.score / avg_score if avg_score > 0 else 1.0
             market_budget = order_usdc
@@ -1164,10 +1234,10 @@ class FarmingBot:
                     market.question[:35], market_budget, free_order_cap,
                 )
                 break
-            if market_budget > capital_remaining + 0.01:
+            if quote_cap_per_market > capital_remaining + 0.01:
                 log.info(
-                    "Skip '%s': order $%.2f > bot capital remaining $%.2f",
-                    market.question[:35], market_budget, capital_remaining,
+                    "Skip '%s': quote cap $%.2f > bot capital remaining $%.2f",
+                    market.question[:35], quote_cap_per_market, capital_remaining,
                 )
                 break
 
@@ -1182,7 +1252,10 @@ class FarmingBot:
                 # after a successful quote; only the nominal quote limit is
                 # consumed.  Actual fills are tracked separately as inventory.
                 capital_remaining = max(0.0, capital_remaining - spent)
-                slots_remaining = math.floor(capital_remaining / order_usdc) if order_usdc > 0 else 0
+                slots_remaining = (
+                    math.floor(capital_remaining / quote_cap_per_market)
+                    if quote_cap_per_market > 0 else 0
+                )
                 open_condition_ids.add(market.condition_id)
 
     # ── Rotating scanner ───────────────────────────────────────────────────────
@@ -1192,6 +1265,9 @@ class FarmingBot:
         now = datetime.now(timezone.utc)
         min_daily = cfg["min_daily_reward"]
         scanner_mode = str(cfg.get("scanner_mode") or "legacy").lower()
+        farm_mode = normalize_farm_mode(cfg.get("farm_mode"))
+        both_scan_mode = normalize_both_scan_mode(cfg.get("both_scan_mode"))
+        self._handle_farm_mode_change(farm_mode, both_scan_mode)
         if scanner_mode not in ("legacy", "multi", "hybrid"):
             scanner_mode = "legacy"
         mode_changed = self._rewards_cache_scanner_mode not in (None, scanner_mode)
@@ -1252,6 +1328,8 @@ class FarmingBot:
                 self._rewards_cache,
                 min_spread=float(cfg["min_spread"]),
                 order_usdc=max(0.0, float(cfg.get("order_usdc", 0) or 0)),
+                farm_mode=farm_mode,
+                both_scan_mode=both_scan_mode,
                 word_blacklist=cfg.get("word_blacklist", []),
             )
 
@@ -1308,6 +1386,8 @@ class FarmingBot:
                 max_daily_trades=cfg["max_daily_trades"],
                 max_bid_depth_spread=cfg.get("max_bid_depth_spread", 4.0),
                 market_rewards=batch if scanner_mode == "multi" else None,
+                farm_mode=farm_mode,
+                both_scan_mode=both_scan_mode,
             )
 
         # Merge into pool: update existing + add new
@@ -1336,7 +1416,29 @@ class FarmingBot:
         if order_usdc > 0:
             self._candidates_pool = {
                 cid: m for cid, m in self._candidates_pool.items()
-                if m.min_order_cost <= order_usdc
+                if not self._candidate_matches_farm_strategy(
+                    m,
+                    farm_mode,
+                    both_scan_mode,
+                )
+                or m.min_order_cost <= order_usdc
+            }
+
+        # After a full rotation, retire candidates scanned for the previous
+        # side, except markets with live positions that must remain managed.
+        if self._scan_cursor == 0:
+            active_condition_ids = {
+                str(position.get("condition_id") or "")
+                for position in await db.get_active_positions()
+            }
+            self._candidates_pool = {
+                cid: market for cid, market in self._candidates_pool.items()
+                if self._candidate_matches_farm_strategy(
+                    market,
+                    farm_mode,
+                    both_scan_mode,
+                )
+                or cid in active_condition_ids
             }
 
         # Prune pool: keep top POOL_MAX_SIZE by score
@@ -1344,7 +1446,11 @@ class FarmingBot:
         self._candidates_pool = {m.condition_id: m for m in pool_sorted[:POOL_MAX_SIZE]}
 
         capital_limit = max(0.0, float(cfg.get("bot_capital_limit_usdc", 0) or 0))
-        max_slots = max(1, math.floor(capital_limit / order_usdc)) if order_usdc > 0 else 1
+        quote_cap_per_market = order_usdc
+        max_slots = (
+            max(1, math.floor(capital_limit / quote_cap_per_market))
+            if quote_cap_per_market > 0 else 1
+        )
         shown = pool_sorted[:max_slots]
         self.scan_status.update({
             "batch_size": len(batch),
@@ -1408,13 +1514,31 @@ class FarmingBot:
             )
             return
 
-        # Cancel just enough worst positions (≤ max_slots_per_market) to free 1 slot
-        to_cancel = []
+        # Treat a persisted two-sided entry as one rebalance unit. This prevents
+        # a restart or mode switch from leaving half of a reward pair behind.
+        open_by_group: dict[str, list[dict]] = {}
+        for position in open_positions:
+            if str(position.get("side") or "").upper() != "BUY":
+                continue
+            group_id = str(position.get("entry_group_id") or "")
+            if group_id:
+                open_by_group.setdefault(group_id, []).append(position)
+
+        to_cancel: list[dict] = []
+        selected_units: set[str] = set()
         for pos in scorable:
             if candidate_map[pos["condition_id"]].score >= best.score / 1.3:
                 break
-            to_cancel.append(pos)
-            if len(to_cancel) >= max_slots_per_market:
+            group_id = str(pos.get("entry_group_id") or "")
+            unit_id = group_id or str(pos.get("order_id") or "")
+            if unit_id in selected_units:
+                continue
+            selected_units.add(unit_id)
+            if group_id:
+                to_cancel.extend(open_by_group.get(group_id, [pos]))
+            else:
+                to_cancel.append(pos)
+            if len(selected_units) >= max_slots_per_market:
                 break
 
         log.info(
@@ -1632,35 +1756,16 @@ class FarmingBot:
             if condition_id:
                 self._replacing_condition_ids.discard(condition_id)
 
-    async def _enter_market(self, market: ScoredMarket, slot_budget: float, cfg: dict) -> float:
-        """Place a single-sided BUY order on the more expensive token.
-        Uses up to the fixed per-position budget.
-        Returns total USDC spent."""
-
-        if not market.tokens:
-            return 0.0
-
-        if await db.is_market_banned(market.condition_id):
-            log.info("Skip '%s': market is manually banned", market.question[:40])
-            self._candidates_pool.pop(market.condition_id, None)
-            return 0.0
-        if not await order_manager.can_place(market.condition_id):
-            cooldown_remaining = await order_manager.placement_cooldown_remaining(
-                market.condition_id
-            )
-            log.debug(
-                "Skip '%s': placement cooldown %.0fs",
-                market.question[:40],
-                cooldown_remaining,
-            )
-            return 0.0
-
-        # Pick the buy token used by the strategy.
-        valid = [t for t in market.tokens if 0 < float(t["price"]) < 1]
-        if not valid:
-            valid = market.tokens
-        token = min(valid, key=lambda t: float(t["price"]))
-
+    async def _prepare_buy_plan(
+        self,
+        market: ScoredMarket,
+        token: dict,
+        slot_budget: float,
+        cfg: dict,
+        *,
+        enforce_book_quality: bool = True,
+    ) -> _BuyPlan | None:
+        """Validate one outcome against its live book without placing an order."""
         token_id = token["token_id"]
         token_mid = float(token["price"])
         if not (0 < token_mid < 1):
@@ -1673,18 +1778,42 @@ class FarmingBot:
         # Guard: fetch live order book and ensure our bid is strictly below best ask.
         # post_only orders get immediately cancelled if bid >= best_ask (taker).
         live_ob = await client.get_order_book(token_id)
+        if live_ob is None and normalize_farm_mode(cfg.get("farm_mode")) == "both":
+            log.info(
+                "Skip '%s': live order book unavailable for %s side of pair",
+                market.question[:40],
+                token.get("outcome", "?"),
+            )
+            return None
         if live_ob is not None:
             live_bids = _extract_bids(live_ob)
             live_asks = _extract_asks(live_ob)
+            live_spread = _ob_spread_cents(live_ob)
+            max_ob_spread = float(cfg.get("max_ob_spread", 2.0))
+            if (
+                enforce_book_quality
+                and live_spread is not None
+                and live_spread > max_ob_spread
+            ):
+                log.info(
+                    "Skip '%s': live bid-ask spread %.1f¢ > max %.1f¢ (on buy token)",
+                    market.question[:40], live_spread, max_ob_spread,
+                )
+                self._candidates_pool.pop(market.condition_id, None)
+                return None
             max_bid_depth = float(cfg.get("max_bid_depth_spread", 4.0))
             depth_spread = bid_depth_spread_cents(live_bids)
-            if depth_spread is not None and depth_spread > max_bid_depth:
+            if (
+                enforce_book_quality
+                and depth_spread is not None
+                and depth_spread > max_bid_depth
+            ):
                 log.info(
                     "Skip '%s': bid depth spread %.1f¢ > max %.1f¢ (on buy token)",
                     market.question[:40], depth_spread, max_bid_depth,
                 )
                 self._candidates_pool.pop(market.condition_id, None)
-                return 0.0
+                return None
 
             if depth == "first":
                 target_price = self._first_position_price(
@@ -1708,8 +1837,9 @@ class FarmingBot:
                             "Skip '%s': bid %.2f would cross ask %.2f and no safe price in zone",
                             market.question[:40], target_price, best_ask,
                         )
-                        return 0.0
+                        return None
 
+        effective_budget = slot_budget
         max_level_share_enabled = bool(cfg.get("target_level_share_enabled", True))
         max_level_share = float(cfg.get("max_target_level_share_pct", 50.0) or 0)
         if live_ob is not None and max_level_share_enabled and max_level_share > 0:
@@ -1720,85 +1850,168 @@ class FarmingBot:
                     "Skip '%s': no existing liquidity at target %.2f¢ for max %.1f%% level share",
                     market.question[:40], target_price * 100, max_level_share,
                 )
-                return 0.0
-            if level_budget < slot_budget:
+                return None
+            if level_budget < effective_budget:
                 log.info(
                     "Shrink BUY budget $%.2f → $%.2f: max %.1f%% of %.2f¢ level (existing=$%.2f) | %s",
-                    slot_budget, level_budget, max_level_share, target_price * 100,
+                    effective_budget, level_budget, max_level_share, target_price * 100,
                     existing_level_usdc, market.question[:45],
                 )
-                slot_budget = level_budget
+                effective_budget = level_budget
 
-        # Size: use as many shares as the slot budget allows, at least min_size
-        min_size = math.ceil(market.rewards_min_size)
-        min_cost = min_size * target_price
-        if min_cost > slot_budget + 0.01:
-            log.info(
-                "Skip '%s': min_cost $%.2f (size=%d × %.2f¢) > budget $%.2f",
-                market.question[:40], min_cost, min_size, target_price * 100, slot_budget,
-            )
-            return 0.0
-
-        max_shares = math.floor(slot_budget / target_price) if target_price > 0 else min_size
-        size = max(min_size, max_shares)
-
-        order_cost = size * target_price
-        if order_cost > slot_budget + 0.01:
-            size = min_size
-            order_cost = size * target_price
-        if order_cost > slot_budget + 0.01:
-            log.info(
-                "Skip '%s': final cost $%.2f > budget $%.2f",
-                market.question[:40], order_cost, slot_budget,
-            )
-            return 0.0
-
-        log.info(
-            "Placing BUY %s @ %.3f size=%.0f cost≈$%.2f (budget=$%.2f) | %s",
-            token.get("outcome", "?"), target_price, size, order_cost,
-            slot_budget, market.question[:60],
+        return _BuyPlan(
+            token=token,
+            target_price=target_price,
+            max_budget=effective_budget,
         )
 
-        local_id = f"local-{uuid.uuid4().hex}"
-        resp, placed = await order_manager.place_position({
-            "order_id": local_id,
-            "condition_id": market.condition_id,
-            "market_question": market.question,
-            "token_id": token_id,
-            "outcome": token.get("outcome", ""),
-            "side": "BUY",
-            "price": target_price,
-            "size": size,
-            "status": "PENDING_PLACE",
-            "placed_at": datetime.now(timezone.utc).isoformat(),
-            "filled_at": None,
-            "matched_size": 0,
-            "reward_earned": 0,
-            "local_id": local_id,
-            "source": "BOT",
-        })
-        self.invalidate_active_positions_cache()
-        if resp is None or bool(getattr(resp, "ambiguous", False)):
-            log.warning(
-                "Ambiguous placement for %s; left in %s for reconciliation",
-                market.condition_id,
-                placed.get("status"),
-            )
+    async def _enter_market(self, market: ScoredMarket, slot_budget: float, cfg: dict) -> float:
+        """Place the configured single-sided order or an equal-share YES+NO pair."""
+
+        if not market.tokens:
             return 0.0
-        if getattr(resp, "ok", True) is False:
-            log.warning(
-                "Rejected order for %s code=%s: %s",
-                market.condition_id,
-                getattr(resp, "error_code", "") or getattr(resp, "code", "unknown"),
-                getattr(resp, "error_message", "") or getattr(resp, "message", "unknown"),
+
+        if await db.is_market_banned(market.condition_id):
+            log.info("Skip '%s': market is manually banned", market.question[:40])
+            self._candidates_pool.pop(market.condition_id, None)
+            return 0.0
+        if not await order_manager.can_place(market.condition_id):
+            cooldown_remaining = await order_manager.placement_cooldown_remaining(
+                market.condition_id
+            )
+            log.debug(
+                "Skip '%s': placement cooldown %.0fs",
+                market.question[:40],
+                cooldown_remaining,
             )
             return 0.0
 
-        order_id = str(placed.get("order_id") or "")
-        if not order_id:
-            log.warning("No order_id in response for %s", market.condition_id)
+        farm_mode = normalize_farm_mode(cfg.get("farm_mode"))
+        both_scan_mode = normalize_both_scan_mode(cfg.get("both_scan_mode"))
+        valid = [token for token in market.tokens if 0 < float(token["price"]) < 1]
+        if not valid:
+            valid = market.tokens
+        selected_indexes = select_buy_token_indexes(valid, farm_mode)
+        if farm_mode == "both" and len(selected_indexes) != 2:
+            log.info(
+                "Skip '%s': two-sided mode requires exactly two valid outcomes",
+                market.question[:40],
+            )
             return 0.0
-        return order_cost
+
+        plans: list[_BuyPlan] = []
+        quality_indexes = set(select_filter_token_indexes(
+            valid,
+            farm_mode,
+            both_scan_mode,
+        ))
+        for index in selected_indexes:
+            plan = await self._prepare_buy_plan(
+                market,
+                valid[index],
+                slot_budget,
+                cfg,
+                enforce_book_quality=index in quality_indexes,
+            )
+            if plan is None:
+                return 0.0
+            plans.append(plan)
+
+        # A pair uses the same share count on both outcomes. The more expensive
+        # or thinner side is therefore the limiting side.
+        min_size = math.ceil(market.rewards_min_size)
+        max_sizes = [
+            math.floor(plan.max_budget / plan.target_price)
+            if plan.target_price > 0 else 0
+            for plan in plans
+        ]
+        combined_price = sum(plan.target_price for plan in plans)
+        total_budget_size = (
+            math.floor(slot_budget / combined_price)
+            if combined_price > 0 else 0
+        )
+        max_sizes.append(total_budget_size)
+        size = min(max_sizes, default=0)
+        if size < min_size:
+            log.info(
+                "Skip '%s': equal size %d < reward minimum %d "
+                "(combined price=%.2f¢, market budget=$%.2f)",
+                market.question[:40], size, min_size,
+                combined_price * 100,
+                slot_budget,
+            )
+            return 0.0
+
+        entry_group_id = (
+            f"pair-{uuid.uuid4().hex}" if farm_mode == "both" else None
+        )
+        # Place the higher-priced side first: it is normally the tighter budget
+        # constraint. If the second placement fails, roll back confirmed orders.
+        plans.sort(key=lambda plan: plan.target_price, reverse=True)
+        successful: list[dict] = []
+        total_cost = 0.0
+        for plan in plans:
+            token = plan.token
+            order_cost = size * plan.target_price
+            log.info(
+                "Placing BUY %s @ %.3f size=%.0f cost≈$%.2f (side budget=$%.2f) | %s",
+                token.get("outcome", "?"), plan.target_price, size, order_cost,
+                plan.max_budget, market.question[:60],
+            )
+
+            local_id = f"local-{uuid.uuid4().hex}"
+            resp, placed = await order_manager.place_position({
+                "order_id": local_id,
+                "condition_id": market.condition_id,
+                "market_question": market.question,
+                "token_id": token["token_id"],
+                "outcome": token.get("outcome", ""),
+                "side": "BUY",
+                "price": plan.target_price,
+                "size": size,
+                "status": "PENDING_PLACE",
+                "placed_at": datetime.now(timezone.utc).isoformat(),
+                "filled_at": None,
+                "matched_size": 0,
+                "reward_earned": 0,
+                "local_id": local_id,
+                "source": "BOT",
+                "farm_mode": farm_mode,
+                "entry_group_id": entry_group_id,
+            })
+            self.invalidate_active_positions_cache()
+            order_id = str(placed.get("order_id") or "")
+            failed = (
+                resp is None
+                or bool(getattr(resp, "ambiguous", False))
+                or getattr(resp, "ok", True) is False
+                or not order_id
+            )
+            if failed:
+                if resp is None or bool(getattr(resp, "ambiguous", False)):
+                    log.warning(
+                        "Ambiguous placement for %s; left in %s for reconciliation",
+                        market.condition_id,
+                        placed.get("status"),
+                    )
+                else:
+                    log.warning(
+                        "Rejected order for %s code=%s: %s",
+                        market.condition_id,
+                        getattr(resp, "error_code", "") or getattr(resp, "code", "unknown"),
+                        getattr(resp, "error_message", "") or getattr(resp, "message", "unknown"),
+                    )
+                for prior in successful:
+                    await order_manager.cancel_order(
+                        prior["order_id"],
+                        reason="paired_entry_rollback",
+                    )
+                return 0.0
+
+            successful.append(placed)
+            total_cost += order_cost
+
+        return total_cost
 
     # ── Monitor open positions ──────────────────────────────────────────────────
 
@@ -2041,7 +2254,15 @@ class FarmingBot:
                     self._level_share_breach_since.pop(order_id, None)
 
                     max_cost = self._max_order_cost_for_level(external_level_usdc, max_level_share)
-                    if target_order_usdc > order_usdc + 1.0 and max_cost > order_usdc + 1.0:
+                    pair_entry = (
+                        normalize_farm_mode(pos.get("farm_mode")) == "both"
+                        and bool(pos.get("entry_group_id"))
+                    )
+                    if (
+                        not pair_entry
+                        and target_order_usdc > order_usdc + 1.0
+                        and max_cost > order_usdc + 1.0
+                    ):
                         balance = await client.get_balance()
                         free_balance = float(balance)
                         buffer_pct = min(100.0, max(0.0, float(cfg.get("free_balance_buffer_pct", 10.0) or 0)))
@@ -2364,6 +2585,8 @@ class FarmingBot:
             "max_slots_per_market":s.max_slots_per_market,
             "scan_interval_s":     s.scan_interval_s,
             "scanner_mode":        s.scanner_mode,
+            "farm_mode":           s.farm_mode,
+            "both_scan_mode":      s.both_scan_mode,
             "min_daily_reward":    s.min_daily_reward,
             "depth":               s.depth,
             "category_blacklist":  s.category_blacklist,
