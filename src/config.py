@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     front_run_eat_pct: float = 30.0             # % of level consumed in window → trigger
     front_run_window_s: float = 3.0             # observation window (seconds)
     front_run_cooldown_s: float = 15.0          # wait before re-entry after exit
+    complement_shadow_enabled: bool = True      # observe complement risk without trading actions
+    complement_shadow_log_interval_s: int = 60  # periodic baseline per active BUY
 
     # User controls
     max_order_usdc: float = 0.0      # legacy: no longer used by the capital model

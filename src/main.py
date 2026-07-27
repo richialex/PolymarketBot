@@ -239,6 +239,7 @@ async def _place_sell_for_unmanaged(position: dict) -> dict:
         },
         pending_status="SELL_PENDING",
     )
+    bot.invalidate_active_positions_cache()
     if (
         resp is None
         or bool(getattr(resp, "ambiguous", False))
@@ -325,6 +326,7 @@ async def take_control_unmanaged(body: UnmanagedAction):
         "reward_earned": 0,
         "source": "ADOPTED",
     })
+    bot.invalidate_active_positions_cache()
     return {"ok": True, "order_id": order_id}
 
 
@@ -340,6 +342,7 @@ async def sell_unmanaged(body: UnmanagedAction):
 @app.delete("/api/positions/{order_id}")
 async def cancel_position(order_id: str):
     ok = await order_manager.cancel_order(order_id, reason="manual_cancel")
+    bot.invalidate_active_positions_cache()
     return {"ok": ok}
 
 
@@ -352,6 +355,7 @@ async def ban_position_market(order_id: str):
     ok = True
     if pos.get("status") in db.WORKING_ORDER_STATUSES:
         ok = await order_manager.cancel_order(order_id, reason="manual_ban")
+        bot.invalidate_active_positions_cache()
 
     ban = await db.ban_market(
         pos["condition_id"],
@@ -378,6 +382,7 @@ async def ban_market(body: MarketBanAction):
 @app.delete("/api/orders/{order_id}")
 async def cancel_order(order_id: str):
     ok = await order_manager.cancel_order(order_id, reason="manual_order_cancel")
+    bot.invalidate_active_positions_cache()
     return {"ok": ok}
 
 
@@ -393,18 +398,22 @@ async def cancel_working_positions():
             cancelled += 1
         else:
             failed.append(order_id)
+    bot.invalidate_active_positions_cache()
     return {"ok": not failed, "cancelled": cancelled, "failed": failed}
 
 
 @app.post("/api/positions/cancel_all")
 async def cancel_all_positions():
     ok = await order_manager.cancel_all(reason="manual_cancel_all")
+    bot.invalidate_active_positions_cache()
     return {"ok": ok}
 
 
 @app.post("/api/positions/reconcile")
 async def reconcile_positions():
-    return await bot.reconcile()
+    result = await bot.reconcile()
+    bot.invalidate_active_positions_cache()
+    return result
 
 
 # ── Bot control ────────────────────────────────────────────────────────────────
@@ -547,6 +556,7 @@ async def update_settings(body: BotSettings):
         data["front_run_cooldown_s"] = max(0.0, float(data["front_run_cooldown_s"]))
     for k, v in data.items():
         await db.set_setting(k, v)
+    bot.update_runtime_settings(data)
     return data
 
 

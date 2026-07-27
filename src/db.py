@@ -150,6 +150,23 @@ async def init_db() -> None:
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_order_attempts_retry ON order_attempts(next_retry_at)"
         )
+        # Older lifecycle transitions could clear filled_at while moving a
+        # matched BUY to EXIT_REQUIRED. Recover the first known execution time;
+        # placed_at is a safe fallback that prevents an infinite sell delay.
+        await db.execute(
+            """
+            UPDATE positions
+            SET filled_at = COALESCE(
+                (
+                    SELECT MIN(order_fills.event_at)
+                    FROM order_fills
+                    WHERE order_fills.order_id = positions.order_id
+                ),
+                placed_at
+            )
+            WHERE matched_size > 0 AND filled_at IS NULL
+            """
+        )
         await db.commit()
 
 
@@ -175,7 +192,7 @@ async def upsert_position(pos: dict) -> None:
                ON CONFLICT(order_id) DO UPDATE SET
                  outcome=excluded.outcome,
                  status=excluded.status,
-                 filled_at=excluded.filled_at,
+                 filled_at=COALESCE(excluded.filled_at, positions.filled_at),
                  matched_size=excluded.matched_size,
                  reward_earned=excluded.reward_earned,
                  parent_order_id=excluded.parent_order_id,
@@ -203,12 +220,25 @@ async def upsert_position(pos: dict) -> None:
         await db.commit()
 
 
-async def update_position_status(order_id: str, status: str, filled_at: str | None = None) -> None:
+_FILLED_AT_UNSET = object()
+
+
+async def update_position_status(
+    order_id: str,
+    status: str,
+    filled_at: str | None | object = _FILLED_AT_UNSET,
+) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE positions SET status=?, filled_at=? WHERE order_id=?",
-            (status, filled_at, order_id),
-        )
+        if filled_at is _FILLED_AT_UNSET:
+            await db.execute(
+                "UPDATE positions SET status=? WHERE order_id=?",
+                (status, order_id),
+            )
+        else:
+            await db.execute(
+                "UPDATE positions SET status=?, filled_at=? WHERE order_id=?",
+                (status, filled_at, order_id),
+            )
         await db.commit()
 
 
@@ -284,12 +314,16 @@ async def record_cumulative_match(
                 ),
             )
 
+        fill_timestamp = (
+            pos.get("filled_at")
+            or (event_at if stored_match > 0 else None)
+        )
         await conn.execute(
             "UPDATE positions SET matched_size=?, status=?, filled_at=? WHERE order_id=?",
             (
                 stored_match,
                 new_status,
-                event_at if new_status == "FILLED" else pos.get("filled_at"),
+                fill_timestamp,
                 order_id,
             ),
         )
@@ -299,6 +333,7 @@ async def record_cumulative_match(
                 "matched_size": stored_match,
                 "status": new_status,
                 "fill_delta": delta,
+                "filled_at": fill_timestamp,
             }
         )
         return pos

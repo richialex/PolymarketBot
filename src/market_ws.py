@@ -38,6 +38,18 @@ class LiveOrderBook:
     hash: str = ""
 
 
+@dataclass(frozen=True)
+class MarketSignalSnapshot:
+    asset_id: str
+    best_bid: float | None
+    best_ask: float | None
+    last_trade_price: float | None
+    last_trade_side: str
+    last_trade_size: float
+    last_trade_at: float
+    updated_at: float
+
+
 @dataclass
 class _BookState:
     asset_id: str
@@ -54,6 +66,8 @@ class _BookState:
     event_count: int = 0
     last_trade_price: float | None = None
     last_trade_side: str = ""
+    last_trade_size: float = 0.0
+    last_trade_at: float = 0.0
     tick_size: str = ""
     resolved: bool = False
     snapshot_epoch: int = 0
@@ -87,6 +101,7 @@ class MarketWsWatcher:
         self._fresh_ttl_s = fresh_ttl_s
         self._books: dict[str, _BookState] = {}
         self._changed_assets: asyncio.Queue[str] = asyncio.Queue(maxsize=1000)
+        self._shadow_changed_assets: asyncio.Queue[str] = asyncio.Queue(maxsize=2000)
         self._lock = asyncio.Lock()
         self._connected = False
         self._connection_epoch = 0
@@ -96,6 +111,26 @@ class MarketWsWatcher:
         self._subscribed_assets: set[str] = set()
         self._ws_book_hits = 0
         self._rest_book_fallbacks = 0
+        self._market_tokens: dict[str, tuple[str, ...]] = {}
+        self._shadow_queue_drops = 0
+
+    def register_market_tokens(self, condition_id: str, token_ids: list[str]) -> None:
+        tokens = tuple(dict.fromkeys(str(token) for token in token_ids if str(token)))
+        if condition_id and len(tokens) >= 2:
+            self._market_tokens[str(condition_id)] = tokens
+
+    def replace_market_tokens(
+        self,
+        market_tokens: dict[str, tuple[str, ...]],
+    ) -> None:
+        """Replace, rather than append to, the bounded condition/token map."""
+        self._market_tokens = {
+            str(condition_id): tuple(
+                dict.fromkeys(str(token) for token in token_ids if str(token))
+            )
+            for condition_id, token_ids in market_tokens.items()
+            if condition_id and len(token_ids) >= 2
+        }
 
     async def run(self) -> None:
         backoff = 1
@@ -141,6 +176,31 @@ class MarketWsWatcher:
     async def next_changed_asset(self) -> str:
         return await self._changed_assets.get()
 
+    async def next_shadow_changed_asset(self) -> str:
+        return await self._shadow_changed_assets.get()
+
+    async def get_signal_snapshot(
+        self,
+        asset_id: str,
+        require_fresh: bool = True,
+    ) -> MarketSignalSnapshot | None:
+        async with self._lock:
+            state = self._books.get(str(asset_id))
+            if state is None or state.resolved or not state.has_snapshot:
+                return None
+            if require_fresh and not self._is_usable_locked(state):
+                return None
+            return MarketSignalSnapshot(
+                asset_id=state.asset_id,
+                best_bid=state.best_bid,
+                best_ask=state.best_ask,
+                last_trade_price=state.last_trade_price,
+                last_trade_side=state.last_trade_side,
+                last_trade_size=state.last_trade_size,
+                last_trade_at=state.last_trade_at,
+                updated_at=state.updated_at,
+            )
+
     async def is_fresh(self, asset_id: str) -> bool:
         async with self._lock:
             state = self._books.get(str(asset_id))
@@ -157,6 +217,9 @@ class MarketWsWatcher:
                 "usable_books": usable_books,
                 "ws_book_hits": self._ws_book_hits,
                 "rest_book_fallbacks": self._rest_book_fallbacks,
+                "tracked_market_pairs": len(self._market_tokens),
+                "shadow_queue_size": self._shadow_changed_assets.qsize(),
+                "shadow_queue_drops": self._shadow_queue_drops,
                 "last_message_age_s": round(now - self._last_message_at, 1) if self._last_message_at else None,
                 "last_pong_age_s": round(now - self._last_pong_at, 1) if self._last_pong_at else None,
             }
@@ -304,6 +367,7 @@ class MarketWsWatcher:
                 _fmt_optional(state.best_ask),
             )
         self._notify_changed_assets({asset_id})
+        self._notify_shadow_assets({asset_id})
 
     async def _handle_price_change(self, event: dict[str, Any]) -> None:
         changes = event.get("price_changes") or []
@@ -341,6 +405,7 @@ class MarketWsWatcher:
                         len(changes),
                     )
         self._notify_changed_assets(touched)
+        self._notify_shadow_assets(touched)
 
     async def _handle_best_bid_ask(self, event: dict[str, Any]) -> None:
         asset_id = str(event.get("asset_id") or "")
@@ -364,6 +429,7 @@ class MarketWsWatcher:
                 state.has_snapshot,
             )
         self._notify_changed_assets({asset_id})
+        self._notify_shadow_assets({asset_id})
 
     async def _handle_last_trade_price(self, event: dict[str, Any]) -> None:
         asset_id = str(event.get("asset_id") or "")
@@ -374,6 +440,8 @@ class MarketWsWatcher:
             state.market = str(event.get("market") or state.market)
             state.last_trade_price = _to_float(event.get("price"))
             state.last_trade_side = str(event.get("side") or "")
+            state.last_trade_size = _to_float(event.get("size")) or 0.0
+            state.last_trade_at = time.monotonic()
             state.timestamp = str(event.get("timestamp") or state.timestamp)
             state.updated_at = time.monotonic()
             state.event_count += 1
@@ -384,6 +452,7 @@ class MarketWsWatcher:
                 _fmt_optional(state.last_trade_price),
                 str(event.get("size") or "?"),
             )
+        self._notify_shadow_assets({asset_id})
 
     async def _handle_tick_size_change(self, event: dict[str, Any]) -> None:
         asset_id = str(event.get("asset_id") or "")
@@ -420,7 +489,14 @@ class MarketWsWatcher:
 
     async def _active_assets(self) -> set[str]:
         positions = await db.get_active_positions()
-        return {str(p.get("token_id") or "") for p in positions if p.get("token_id")}
+        assets: set[str] = set()
+        for position in positions:
+            token_id = str(position.get("token_id") or "")
+            if token_id:
+                assets.add(token_id)
+            condition_id = str(position.get("condition_id") or "")
+            assets.update(self._market_tokens.get(condition_id, ()))
+        return assets
 
     async def _drop_assets(self, assets: list[str]) -> None:
         async with self._lock:
@@ -521,6 +597,23 @@ class MarketWsWatcher:
                     pass
                 try:
                     self._changed_assets.put_nowait(asset_id)
+                except asyncio.QueueFull:
+                    pass
+
+    def _notify_shadow_assets(self, asset_ids: set[str]) -> None:
+        for asset_id in asset_ids:
+            if not asset_id:
+                continue
+            try:
+                self._shadow_changed_assets.put_nowait(asset_id)
+            except asyncio.QueueFull:
+                self._shadow_queue_drops += 1
+                try:
+                    self._shadow_changed_assets.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    self._shadow_changed_assets.put_nowait(asset_id)
                 except asyncio.QueueFull:
                     pass
 

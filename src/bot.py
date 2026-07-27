@@ -6,6 +6,7 @@ import logging
 import math
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 
 from src import db
@@ -17,11 +18,13 @@ from src.scanner import (
     _extract_bids, _extract_asks, _ob_spread_cents, bid_depth_spread_cents,
     multi_reward_from_api, ScoredMarket,
 )
-from src.market_ws import MarketWsWatcher
+from src.logging_setup import configure_shadow_file_logger
+from src.market_ws import MarketSignalSnapshot, MarketWsWatcher
 from src.user_ws import UserWsWatcher
 from src.order_manager import order_manager
 
 log = logging.getLogger(__name__)
+shadow_log = configure_shadow_file_logger()
 
 
 SCAN_BATCH_SIZE  = 100   # markets enriched per tick
@@ -39,8 +42,150 @@ ORDER_STATUS_REST_INTERVAL_S = 30
 ORDER_STATUS_REST_HEALTHY_WS_INTERVAL_S = 300
 AUTO_RECONCILE_INTERVAL_S = 20
 AMBIGUOUS_ABSENCE_GRACE_S = 60
+EXIT_INVENTORY_ABSENCE_GRACE_S = 120
 FAST_STEP_DEBOUNCE_S = 0.75
 FAST_STEP_COOLDOWN_S = 6.0
+COMPLEMENT_SHADOW_EVENT_WINDOW_S = 5.0
+COMPLEMENT_SHADOW_TRADE_WINDOW_S = 3.0
+COMPLEMENT_SHADOW_CANCEL_SCORE = 60
+
+
+@dataclass(frozen=True)
+class _ComplementShadowWatch:
+    order_id: str
+    condition_id: str
+    token_id: str
+    complement_token_id: str
+    outcome: str
+    order_price: float
+    market_question: str
+
+
+def _queue_ahead_usdc(order_book, order_price: float) -> float:
+    total = 0.0
+    for level in (getattr(order_book, "bids", None) or []):
+        try:
+            price = float(getattr(level, "price", 0) or 0)
+            size = float(getattr(level, "size", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if price > order_price + 0.00005:
+            total += price * size
+    return total
+
+
+def _infer_book_tick(*order_books) -> float:
+    best: float | None = None
+    for order_book in order_books:
+        prices: list[float] = []
+        for side in ("bids", "asks"):
+            for level in (getattr(order_book, side, None) or []):
+                try:
+                    prices.append(float(getattr(level, "price", 0) or 0))
+                except (TypeError, ValueError):
+                    continue
+        unique = sorted(set(price for price in prices if 0 < price < 1))
+        for left, right in zip(unique, unique[1:]):
+            diff = right - left
+            if diff > 0.00005 and (best is None or diff < best):
+                best = diff
+    if best is None:
+        return 0.01
+    return min(0.01, max(0.0001, round(best, 4)))
+
+
+def _complement_shadow_metrics(
+    watch: _ComplementShadowWatch,
+    direct_book,
+    complement_book,
+    direct_signal: MarketSignalSnapshot,
+    complement_signal: MarketSignalSnapshot,
+    previous: dict | None,
+    now: float,
+) -> dict:
+    tick = _infer_book_tick(direct_book, complement_book)
+    complement_bid = complement_signal.best_bid
+    if complement_bid is None:
+        return {}
+
+    direct_mid = mid_from_order_book(direct_book)
+    complement_mid = mid_from_order_book(complement_book)
+    synthetic_mid = 1.0 - complement_mid if complement_mid is not None else None
+    synthetic_ask = 1.0 - complement_bid
+    pair_sum = watch.order_price + complement_bid
+    queue_ahead = _queue_ahead_usdc(direct_book, watch.order_price)
+
+    score = 0
+    reasons: list[str] = []
+    hard_risk = pair_sum >= 1.0 - tick - 1e-9
+    if hard_risk:
+        reasons.append("pair_sum_near_one")
+
+    if previous and now - float(previous.get("at", 0)) <= COMPLEMENT_SHADOW_EVENT_WINDOW_S:
+        previous_bid = previous.get("complement_bid")
+        if previous_bid is not None and complement_bid >= float(previous_bid) + tick - 1e-9:
+            score += 40
+            reasons.append("complement_bid_up")
+
+        previous_queue = float(previous.get("queue_ahead", 0) or 0)
+        if previous_queue > 0:
+            queue_drop_pct = max(0.0, (previous_queue - queue_ahead) / previous_queue * 100.0)
+            if queue_drop_pct >= 30.0:
+                score += 20
+                reasons.append("queue_ahead_down")
+        else:
+            queue_drop_pct = 0.0
+    else:
+        queue_drop_pct = 0.0
+
+    trade_age = (
+        now - complement_signal.last_trade_at
+        if complement_signal.last_trade_at > 0
+        else None
+    )
+    if (
+        trade_age is not None
+        and trade_age <= COMPLEMENT_SHADOW_TRADE_WINDOW_S
+        and complement_signal.last_trade_side.upper() == "BUY"
+    ):
+        score += 30
+        reasons.append("complement_buy_trade")
+
+    if (
+        direct_mid is not None
+        and synthetic_mid is not None
+        and synthetic_mid <= direct_mid - tick + 1e-9
+    ):
+        score += 20
+        reasons.append("synthetic_mid_lower")
+
+    return {
+        "score": score,
+        "would_cancel": hard_risk or score >= COMPLEMENT_SHADOW_CANCEL_SCORE,
+        "hard_risk": hard_risk,
+        "reasons": reasons,
+        "tick": tick,
+        "direct_bid": direct_signal.best_bid,
+        "direct_ask": direct_signal.best_ask,
+        "direct_mid": direct_mid,
+        "complement_bid": complement_bid,
+        "complement_ask": complement_signal.best_ask,
+        "complement_mid": complement_mid,
+        "synthetic_ask": synthetic_ask,
+        "synthetic_mid": synthetic_mid,
+        "pair_sum": pair_sum,
+        "queue_ahead_usdc": queue_ahead,
+        "queue_drop_pct": queue_drop_pct,
+        "last_trade_price": complement_signal.last_trade_price,
+        "last_trade_side": complement_signal.last_trade_side,
+        "last_trade_size": complement_signal.last_trade_size,
+        "last_trade_age_s": trade_age,
+        "next_previous": {
+            "at": now,
+            "complement_bid": complement_bid,
+            "queue_ahead": queue_ahead,
+        },
+    }
 
 
 class FarmingBot:
@@ -50,6 +195,7 @@ class FarmingBot:
         self._trader_task: asyncio.Task | None = None
         self._monitor_task: asyncio.Task | None = None
         self._fast_step_task: asyncio.Task | None = None
+        self._complement_shadow_task: asyncio.Task | None = None
         self._user_ws_task: asyncio.Task | None = None
         self._market_ws_task: asyncio.Task | None = None
         self._user_ws = UserWsWatcher()
@@ -70,6 +216,22 @@ class FarmingBot:
         self._fr_prev_size: dict[str, float] = {}        # token → previous best bid size (shares)
         self._fr_prev_time: dict[str, float] = {}        # token → previous timestamp
         self._fr_cooldown_until: dict[str, float] = {}   # token → cooldown expiry
+        self._runtime_cfg: dict | None = None
+        self._runtime_cfg_updated_at: float = 0.0
+        self._active_positions_cache_initialized = False
+        self._active_positions_cache_updated_at: float = 0.0
+        self._active_positions_by_token: dict[str, tuple[dict, ...]] = {}
+        self._active_positions_by_condition: dict[str, tuple[dict, ...]] = {}
+        self._open_buy_by_token: dict[str, dict] = {}
+        self._market_tokens_by_condition: dict[str, tuple[str, ...]] = {}
+        self._shadow_watches_by_asset: dict[str, list[_ComplementShadowWatch]] = {}
+        self._shadow_previous: dict[str, dict] = {}
+        self._shadow_last_log_at: dict[str, float] = {}
+        self._shadow_last_baseline_at: dict[str, float] = {}
+        self._shadow_enabled = True
+        self._shadow_log_interval_s = 60
+        self._shadow_signal_count = 0
+        self._shadow_would_cancel_count = 0
         self._last_active_reward_check_at: float = 0.0
         order_manager.set_execution_callback(self._handle_execution_event)
 
@@ -104,6 +266,7 @@ class FarmingBot:
         self._trader_task = asyncio.create_task(self._trader_loop())
         self._monitor_task = asyncio.create_task(self._monitor_loop())
         self._fast_step_task = asyncio.create_task(self._fast_step_loop())
+        self._complement_shadow_task = asyncio.create_task(self._complement_shadow_loop())
         self._user_ws_task = asyncio.create_task(self._user_ws.run())
         self._market_ws_task = asyncio.create_task(self._market_ws.run())
         log.info("FarmingBot started")
@@ -115,6 +278,7 @@ class FarmingBot:
             self._trader_task,
             self._monitor_task,
             self._fast_step_task,
+            self._complement_shadow_task,
             self._user_ws_task,
             self._market_ws_task,
         ):
@@ -124,6 +288,7 @@ class FarmingBot:
         self._trader_task = None
         self._monitor_task = None
         self._fast_step_task = None
+        self._complement_shadow_task = None
         self._user_ws_task = None
         self._market_ws_task = None
         log.info("FarmingBot stopped")
@@ -133,6 +298,18 @@ class FarmingBot:
         self._candidates_pool.pop(condition_id, None)
         self.last_scan = [m for m in self.last_scan if m.condition_id != condition_id]
         self.shown_markets = [m for m in self.shown_markets if m.condition_id != condition_id]
+        self._prune_market_token_cache()
+
+    def update_runtime_settings(self, values: dict) -> None:
+        """Apply an already-persisted settings update to the read-only RAM snapshot."""
+        if self._runtime_cfg is None:
+            return
+        self._runtime_cfg = {**self._runtime_cfg, **values}
+        self._runtime_cfg_updated_at = time.monotonic()
+
+    def invalidate_active_positions_cache(self) -> None:
+        """Force one SQLite refresh after a critical order lifecycle change."""
+        self._active_positions_cache_initialized = False
 
     async def reconcile(self) -> dict:
         """Reconcile local order journal with Polymarket open orders and holdings."""
@@ -291,10 +468,298 @@ class FarmingBot:
         log.info("MARKET_WS fallback_rest purpose=%s token=%s", purpose, _short_id(token_id))
         return await client.get_order_book(token_id)
 
+    def _remember_market_tokens(self, market: ScoredMarket) -> None:
+        token_ids = tuple(
+            dict.fromkeys(
+                str(token.get("token_id") or "")
+                for token in market.tokens
+                if str(token.get("token_id") or "")
+            )
+        )
+        if len(token_ids) < 2:
+            return
+        self._market_tokens_by_condition[market.condition_id] = token_ids
+        self._market_ws.register_market_tokens(market.condition_id, list(token_ids))
+
+    def _prune_market_token_cache(self) -> None:
+        """Keep token pairs only for current candidates and active positions."""
+        retained_conditions = {
+            market.condition_id for market in self.last_scan
+        } | set(self._active_positions_by_condition)
+        self._market_tokens_by_condition = {
+            condition_id: token_ids
+            for condition_id, token_ids in self._market_tokens_by_condition.items()
+            if condition_id in retained_conditions
+        }
+        self._market_ws.replace_market_tokens(self._market_tokens_by_condition)
+
+    def _replace_active_positions_cache(self, positions: list[dict]) -> None:
+        """Atomically replace bounded active-position indexes."""
+        by_token: dict[str, list[dict]] = {}
+        by_condition: dict[str, list[dict]] = {}
+        open_buy_by_token: dict[str, dict] = {}
+
+        for raw_position in positions:
+            position = dict(raw_position)
+            token_id = str(position.get("token_id") or "")
+            condition_id = str(position.get("condition_id") or "")
+            if token_id:
+                by_token.setdefault(token_id, []).append(position)
+            if condition_id:
+                by_condition.setdefault(condition_id, []).append(position)
+            if (
+                token_id
+                and str(position.get("side") or "").upper() == "BUY"
+                and str(position.get("status") or "").upper() in db.LIVE_ORDER_STATUSES
+            ):
+                # SQLite returns newest first; keep the first live BUY per token.
+                open_buy_by_token.setdefault(token_id, position)
+
+        self._active_positions_by_token = {
+            token_id: tuple(items) for token_id, items in by_token.items()
+        }
+        self._active_positions_by_condition = {
+            condition_id: tuple(items) for condition_id, items in by_condition.items()
+        }
+        self._open_buy_by_token = open_buy_by_token
+        self._active_positions_cache_initialized = True
+        self._active_positions_cache_updated_at = time.monotonic()
+        self._prune_market_token_cache()
+        open_positions = [
+            position
+            for positions_for_condition in self._active_positions_by_condition.values()
+            for position in positions_for_condition
+            if str(position.get("status") or "").upper() in db.LIVE_ORDER_STATUSES
+        ]
+        self._refresh_complement_shadow_watches(open_positions)
+
+    async def _refresh_active_positions_cache(self) -> list[dict]:
+        positions = await db.get_active_positions()
+        self._replace_active_positions_cache(positions)
+        return positions
+
+    async def _cached_open_buy(self, token_id: str) -> dict | None:
+        if not self._active_positions_cache_initialized:
+            await self._refresh_active_positions_cache()
+        return self._open_buy_by_token.get(str(token_id))
+
+    async def _cached_runtime_cfg(self) -> dict:
+        if self._runtime_cfg is None:
+            return await self._load_cfg()
+        return self._runtime_cfg
+
+    def _refresh_complement_shadow_watches(self, positions: list[dict]) -> None:
+        watches_by_asset: dict[str, list[_ComplementShadowWatch]] = {}
+        active_order_ids: set[str] = set()
+
+        for position in positions:
+            if str(position.get("side") or "").upper() != "BUY":
+                continue
+            condition_id = str(position.get("condition_id") or "")
+            token_id = str(position.get("token_id") or "")
+            token_ids = self._market_tokens_by_condition.get(condition_id, ())
+            complement_id = next((item for item in token_ids if item != token_id), "")
+            if not token_id or not complement_id:
+                continue
+
+            watch = _ComplementShadowWatch(
+                order_id=str(position.get("order_id") or ""),
+                condition_id=condition_id,
+                token_id=token_id,
+                complement_token_id=complement_id,
+                outcome=str(position.get("outcome") or ""),
+                order_price=float(position.get("price") or 0),
+                market_question=str(position.get("market_question") or ""),
+            )
+            active_order_ids.add(watch.order_id)
+            watches_by_asset.setdefault(token_id, []).append(watch)
+            watches_by_asset.setdefault(complement_id, []).append(watch)
+
+        self._shadow_watches_by_asset = watches_by_asset
+        self._shadow_previous = {
+            order_id: state
+            for order_id, state in self._shadow_previous.items()
+            if order_id in active_order_ids
+        }
+        self._shadow_last_log_at = {
+            order_id: timestamp
+            for order_id, timestamp in self._shadow_last_log_at.items()
+            if order_id in active_order_ids
+        }
+        self._shadow_last_baseline_at = {
+            order_id: timestamp
+            for order_id, timestamp in self._shadow_last_baseline_at.items()
+            if order_id in active_order_ids
+        }
+
+    async def _complement_shadow_loop(self) -> None:
+        next_periodic_at = time.monotonic() + 30.0
+        while self.running:
+            try:
+                triggered_asset: str | None = None
+                try:
+                    triggered_asset = await asyncio.wait_for(
+                        self._market_ws.next_shadow_changed_asset(),
+                        timeout=max(0.1, next_periodic_at - time.monotonic()),
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+                if not self._shadow_enabled:
+                    next_periodic_at = time.monotonic() + 30.0
+                    continue
+
+                if triggered_asset is not None:
+                    for watch in self._shadow_watches_by_asset.get(triggered_asset, ()):
+                        await self._evaluate_complement_shadow(
+                            watch,
+                            triggered_asset=triggered_asset,
+                        )
+
+                if time.monotonic() >= next_periodic_at:
+                    unique = {
+                        watch.order_id: watch
+                        for watches in self._shadow_watches_by_asset.values()
+                        for watch in watches
+                    }
+                    for watch in unique.values():
+                        await self._evaluate_complement_shadow(
+                            watch,
+                            triggered_asset="periodic",
+                            force_baseline=True,
+                        )
+                    next_periodic_at = time.monotonic() + 30.0
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                log.exception("Complement shadow loop error")
+                await asyncio.sleep(1)
+
+    async def _evaluate_complement_shadow(
+        self,
+        watch: _ComplementShadowWatch,
+        *,
+        triggered_asset: str,
+        force_baseline: bool = False,
+    ) -> None:
+        direct_book = await self._market_ws.get_order_book(watch.token_id)
+        complement_book = await self._market_ws.get_order_book(watch.complement_token_id)
+        direct_signal = await self._market_ws.get_signal_snapshot(watch.token_id)
+        complement_signal = await self._market_ws.get_signal_snapshot(
+            watch.complement_token_id
+        )
+        if (
+            direct_book is None
+            or complement_book is None
+            or direct_signal is None
+            or complement_signal is None
+        ):
+            return
+
+        now = time.monotonic()
+        metrics = _complement_shadow_metrics(
+            watch,
+            direct_book,
+            complement_book,
+            direct_signal,
+            complement_signal,
+            self._shadow_previous.get(watch.order_id),
+            now,
+        )
+        if not metrics:
+            return
+        self._shadow_previous[watch.order_id] = metrics.pop("next_previous")
+
+        score = int(metrics["score"])
+        would_cancel = bool(metrics["would_cancel"])
+        baseline_due = (
+            force_baseline
+            and now - self._shadow_last_baseline_at.get(watch.order_id, 0.0)
+            >= self._shadow_log_interval_s
+        )
+        has_signal = bool(metrics["reasons"])
+        signal_due = has_signal and (
+            would_cancel
+            or now - self._shadow_last_log_at.get(watch.order_id, 0.0) >= 1.0
+        )
+        if not baseline_due and not signal_due:
+            return
+
+        if baseline_due:
+            self._shadow_last_baseline_at[watch.order_id] = now
+        if signal_due:
+            self._shadow_last_log_at[watch.order_id] = now
+            self._shadow_signal_count += 1
+            if would_cancel:
+                self._shadow_would_cancel_count += 1
+
+        shadow_log.info(
+            "COMPLEMENT_SHADOW kind=%s would_cancel=%s score=%d reasons=%s "
+            "order=%s condition=%s outcome=%s order_price=%.4f "
+            "direct_bid=%s direct_ask=%s direct_mid=%s "
+            "complement_bid=%s complement_ask=%s complement_mid=%s "
+            "synthetic_ask=%s synthetic_mid=%s pair_sum=%.4f "
+            "queue_ahead_usdc=%.2f queue_drop_pct=%.1f "
+            "last_trade_price=%s last_trade_side=%s last_trade_size=%.4f "
+            "trigger=%s market=%s",
+            "signal" if signal_due else "baseline",
+            would_cancel,
+            score,
+            ",".join(metrics["reasons"]) or "-",
+            _short_id(watch.order_id),
+            _short_id(watch.condition_id),
+            watch.outcome or "?",
+            watch.order_price,
+            _fmt_optional(metrics["direct_bid"]),
+            _fmt_optional(metrics["direct_ask"]),
+            _fmt_optional(metrics["direct_mid"]),
+            _fmt_optional(metrics["complement_bid"]),
+            _fmt_optional(metrics["complement_ask"]),
+            _fmt_optional(metrics["complement_mid"]),
+            _fmt_optional(metrics["synthetic_ask"]),
+            _fmt_optional(metrics["synthetic_mid"]),
+            metrics["pair_sum"],
+            metrics["queue_ahead_usdc"],
+            metrics["queue_drop_pct"],
+            _fmt_optional(metrics["last_trade_price"]),
+            metrics["last_trade_side"] or "?",
+            metrics["last_trade_size"],
+            _short_id(triggered_asset) if triggered_asset != "periodic" else "periodic",
+            watch.market_question[:80],
+        )
+
     async def ws_status(self) -> dict:
+        now = time.monotonic()
         return {
             "market_ws": await self._market_ws.status(),
             "user_ws": self._user_ws.status(),
+            "complement_shadow": {
+                "enabled": self._shadow_enabled,
+                "active_watches": len({
+                    watch.order_id
+                    for watches in self._shadow_watches_by_asset.values()
+                    for watch in watches
+                }),
+                "signals_logged": self._shadow_signal_count,
+                "would_cancel": self._shadow_would_cancel_count,
+            },
+            "runtime_cache": {
+                "config_loaded": self._runtime_cfg is not None,
+                "config_age_s": (
+                    round(now - self._runtime_cfg_updated_at, 1)
+                    if self._runtime_cfg_updated_at else None
+                ),
+                "active_positions": sum(
+                    len(items) for items in self._active_positions_by_condition.values()
+                ),
+                "active_tokens": len(self._active_positions_by_token),
+                "open_buy_tokens": len(self._open_buy_by_token),
+                "positions_age_s": (
+                    round(now - self._active_positions_cache_updated_at, 1)
+                    if self._active_positions_cache_updated_at else None
+                ),
+                "tracked_market_pairs": len(self._market_tokens_by_condition),
+            },
         }
 
     def _should_check_order_status(self, order_id: str, interval_s: int = ORDER_STATUS_REST_INTERVAL_S) -> bool:
@@ -308,10 +773,12 @@ class FarmingBot:
     # ── Main loop ───────────────────────────────────────────────────────────────
 
     async def _scanner_loop(self) -> None:
+        interval = 60
         while self.running:
             try:
                 cfg = await self._load_cfg()
                 await self.scan_once(cfg)
+                interval = int(cfg.get("scan_interval_s", 60) or 60)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -319,8 +786,7 @@ class FarmingBot:
                 self.errors = ([msg] + self.errors)[:50]
                 log.exception("Scanner loop error: %s", e)
 
-            interval = await db.get_setting("scan_interval_s", 60)
-            await asyncio.sleep(int(interval))
+            await asyncio.sleep(interval)
 
     async def _trader_loop(self) -> None:
         await asyncio.sleep(2)
@@ -395,53 +861,51 @@ class FarmingBot:
                 due = [asset for asset, deadline in pending.items() if deadline <= now]
                 for asset_id in due:
                     pending.pop(asset_id, None)
-                    await self._check_front_run(asset_id)
-                    await self._fast_step_down_asset(asset_id)
+                    cfg = await self._cached_runtime_cfg()
+                    pos = await self._cached_open_buy(asset_id)
+                    front_run_handled = await self._check_front_run(asset_id, cfg, pos)
+                    if not front_run_handled:
+                        await self._fast_step_down_asset(asset_id, cfg, pos)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 log.exception("Fast step loop error: %s", e)
                 await asyncio.sleep(1)
 
-    async def _check_front_run(self, token_id: str) -> None:
+    async def _check_front_run(
+        self,
+        token_id: str,
+        cfg: dict,
+        pos: dict | None,
+    ) -> bool:
         """Cancel BUY if thin level ahead is being eaten rapidly."""
-        cfg = await self._load_cfg()
         if not cfg.get("front_run_protection", True):
-            return
+            return False
 
         now = time.monotonic()
         if now < self._fr_cooldown_until.get(token_id, 0.0):
-            return
+            return False
 
-        positions = await db.get_open_positions()
-        pos = next(
-            (
-                p for p in positions
-                if str(p.get("token_id") or "") == str(token_id)
-                and str(p.get("side") or "").upper() == "BUY"
-            ),
-            None,
-        )
         if pos is None:
             self._fr_prev_size.pop(token_id, None)
             self._fr_prev_time.pop(token_id, None)
-            return
+            return False
 
         order_book = await self._market_ws.get_order_book(token_id)
         if order_book is None:
-            return
+            return False
 
         current_price = float(pos.get("price", 0) or 0)
         live_bids = _extract_bids(order_book)
         if not live_bids:
-            return
+            return False
 
         levels = sorted(set(round(b, 3) for b in live_bids), reverse=True)
         best_bid = levels[0]
 
         # If we ARE the best bid, the existing step-down logic handles it
         if abs(current_price - best_bid) < 0.0005:
-            return
+            return False
 
         # Get best bid size in USD
         best_bid_usd = 0.0
@@ -459,7 +923,7 @@ class FarmingBot:
             # Level ahead is thick — no protection needed, reset tracking
             self._fr_prev_size.pop(token_id, None)
             self._fr_prev_time.pop(token_id, None)
-            return
+            return False
 
         # Track consumption
         prev_size = self._fr_prev_size.get(token_id)
@@ -468,15 +932,15 @@ class FarmingBot:
         self._fr_prev_time[token_id] = now
 
         if prev_size is None or prev_time is None or prev_size <= 0:
-            return
+            return False
 
         elapsed = now - prev_time
         if elapsed <= 0:
-            return
+            return False
 
         consumed = prev_size - best_bid_usd
         if consumed <= 0:
-            return
+            return False
 
         eat_pct = float(cfg.get("front_run_eat_pct", 30.0) or 30.0)
         window_s = float(cfg.get("front_run_window_s", 3.0) or 3.0)
@@ -491,14 +955,23 @@ class FarmingBot:
                 pos.get("market_question", "")[:45],
             )
             cancelled = await order_manager.cancel_order(pos["order_id"], reason="front_run")
+            self.invalidate_active_positions_cache()
             if cancelled:
                 self._candidates_pool.pop(pos.get("condition_id"), None)
             self._fr_cooldown_until[token_id] = time.monotonic() + cooldown_s
             self._fr_prev_size.pop(token_id, None)
             self._fr_prev_time.pop(token_id, None)
+            # Do not run step-down against the same cached order after a
+            # front-run cancellation attempt, including an ambiguous failure.
+            return True
+        return False
 
-    async def _fast_step_down_asset(self, token_id: str) -> None:
-        cfg = await self._load_cfg()
+    async def _fast_step_down_asset(
+        self,
+        token_id: str,
+        cfg: dict,
+        pos: dict | None,
+    ) -> None:
         depth = str(cfg.get("depth") or "").lower()
         if depth == "first":
             return
@@ -507,15 +980,6 @@ class FarmingBot:
         if now < self._fast_step_cooldown_until.get(token_id, 0.0):
             return
 
-        positions = await db.get_open_positions()
-        pos = next(
-            (
-                p for p in positions
-                if str(p.get("token_id") or "") == str(token_id)
-                and str(p.get("side") or "").upper() == "BUY"
-            ),
-            None,
-        )
         if pos is None:
             self._fast_step_cooldown_until.pop(token_id, None)
             return
@@ -542,7 +1006,11 @@ class FarmingBot:
                 "FAST_STEP cancel unprotected BUY %s: no bid level behind us | %s",
                 pos["order_id"], pos.get("market_question", "")[:45],
             )
-            await order_manager.cancel_order(pos["order_id"], reason="unprotected_best_bid")
+            await order_manager.cancel_order(
+                pos["order_id"],
+                reason="unprotected_best_bid",
+            )
+            self.invalidate_active_positions_cache()
             return
 
         live_mid = mid_from_order_book(order_book)
@@ -558,7 +1026,11 @@ class FarmingBot:
                 "FAST_STEP cancel BUY %s: next bid %.3f outside safe reward range | %s",
                 pos["order_id"], second_level, pos.get("market_question", "")[:45],
             )
-            await order_manager.cancel_order(pos["order_id"], reason="no_safe_step_level")
+            await order_manager.cancel_order(
+                pos["order_id"],
+                reason="no_safe_step_level",
+            )
+            self.invalidate_active_positions_cache()
             return
 
         log.info(
@@ -585,6 +1057,16 @@ class FarmingBot:
             trade_candidates, shown_candidates = await self._rotating_scan(cfg)
             self.last_scan = trade_candidates
             self.shown_markets = shown_candidates
+            for market in trade_candidates:
+                self._remember_market_tokens(market)
+            self._prune_market_token_cache()
+            if self._active_positions_cache_initialized:
+                active_positions = [
+                    position
+                    for items in self._active_positions_by_condition.values()
+                    for position in items
+                ]
+                self._replace_active_positions_cache(active_positions)
         log.info(
             "Pool has %d candidates after scan; UI shows %d",
             len(trade_candidates), len(shown_candidates),
@@ -1144,6 +1626,7 @@ class FarmingBot:
                 side=side or pos["side"],
             )
             self._last_order_status_check.pop(str(pos.get("order_id") or ""), None)
+            self.invalidate_active_positions_cache()
             return replaced
         finally:
             if condition_id:
@@ -1294,6 +1777,7 @@ class FarmingBot:
             "local_id": local_id,
             "source": "BOT",
         })
+        self.invalidate_active_positions_cache()
         if resp is None or bool(getattr(resp, "ambiguous", False)):
             log.warning(
                 "Ambiguous placement for %s; left in %s for reconciliation",
@@ -1322,7 +1806,17 @@ class FarmingBot:
         # Recover any FILLED BUY positions whose SELL was never placed or was cancelled
         await self._recover_missing_sells(cfg)
 
-        open_positions = await db.get_open_positions()
+        self._shadow_enabled = bool(cfg.get("complement_shadow_enabled", True))
+        self._shadow_log_interval_s = max(
+            10,
+            int(cfg.get("complement_shadow_log_interval_s", 60) or 60),
+        )
+        active_positions = await self._refresh_active_positions_cache()
+        open_positions = [
+            position
+            for position in active_positions
+            if str(position.get("status") or "").upper() in db.LIVE_ORDER_STATUSES
+        ]
         if not open_positions:
             self._last_order_status_check.clear()
             return
@@ -1614,6 +2108,7 @@ class FarmingBot:
         inventory.  A partial SELL re-enters here through its parent BUY and
         continues only with the unsold remainder.
         """
+        self.invalidate_active_positions_cache()
         side = str(pos.get("side") or "").upper()
         buy = pos
         if side == "SELL":
@@ -1680,7 +2175,6 @@ class FarmingBot:
                 await db.update_position_status(
                     pos["order_id"],
                     "EXITED",
-                    filled_at=pos.get("filled_at"),
                 )
             return True
 
@@ -1689,6 +2183,34 @@ class FarmingBot:
             log.warning("Cannot verify token balance for exit BUY %s; will retry", pos["order_id"])
             return False
         all_working_sells = await db.get_working_sell_remaining(pos["token_id"])
+        execution_at = (
+            _parse_dt(pos.get("filled_at"))
+            or _parse_dt(pos.get("placed_at"))
+        )
+        execution_age_s = (
+            (datetime.now(timezone.utc) - execution_at).total_seconds()
+            if execution_at is not None
+            else 0.0
+        )
+        if (
+            actual_tokens <= 0.0001
+            and all_working_sells <= 0.0001
+            and execution_age_s >= EXIT_INVENTORY_ABSENCE_GRACE_S
+        ):
+            # A manually sold or otherwise externally closed inventory has no
+            # child SELL in our journal. The reachable Position API is the
+            # authority here; retire the stale parent instead of retrying it
+            # forever as EXIT_REQUIRED.
+            await db.update_position_status(pos["order_id"], "EXITED")
+            self.invalidate_active_positions_cache()
+            log.info(
+                "Mark EXITED: no remote inventory and no working SELL for BUY %s "
+                "(execution age %.0fs) | %s",
+                pos["order_id"],
+                execution_age_s,
+                pos.get("market_question", "")[:50],
+            )
+            return True
         available_tokens = max(0.0, actual_tokens - all_working_sells)
         exit_size = min(uncovered, available_tokens)
         if exit_size <= 0.0001:
@@ -1711,8 +2233,17 @@ class FarmingBot:
         now = datetime.now(timezone.utc)
         if sell_mode == "market_after_delay" and not force_immediate:
             delay_s = max(0, int(cfg.get("market_sell_delay_s", 60) or 0))
-            filled_at = _parse_dt(pos.get("filled_at")) or now
-            elapsed_s = (now - filled_at).total_seconds()
+            filled_at = (
+                _parse_dt(pos.get("filled_at"))
+                or _parse_dt(pos.get("placed_at"))
+            )
+            # A legacy row may have lost filled_at. Never restart the delay on
+            # every recovery cycle; placed_at makes the exit immediately due.
+            elapsed_s = (
+                (now - filled_at).total_seconds()
+                if filled_at is not None
+                else float(delay_s)
+            )
             if elapsed_s < delay_s:
                 log.debug(
                     "Wait before market SELL for BUY %s: %.0fs/%.0fs | %s",
@@ -1822,41 +2353,48 @@ class FarmingBot:
 
     async def _load_cfg(self) -> dict:
         from src.config import settings as s
-        legacy_max_order = await db.get_setting("max_order_usdc", s.max_order_usdc)
+        stored = await db.get_all_settings()
+        legacy_max_order = stored.get("max_order_usdc", s.max_order_usdc)
         legacy_order_default = legacy_max_order if float(legacy_max_order or 0) > 0 else s.order_usdc
-        return {
-            "order_usdc":          await db.get_setting("order_usdc",          legacy_order_default),
-            "bot_capital_limit_usdc": await db.get_setting("bot_capital_limit_usdc", s.bot_capital_limit_usdc),
-            "free_balance_buffer_pct": await db.get_setting("free_balance_buffer_pct", s.free_balance_buffer_pct),
-            "slot_pct":            await db.get_setting("slot_pct",            s.slot_pct),
-            "max_slots_per_market":await db.get_setting("max_slots_per_market",s.max_slots_per_market),
-            "scan_interval_s":     await db.get_setting("scan_interval_s",     s.scan_interval_s),
-            "scanner_mode":        await db.get_setting("scanner_mode",        s.scanner_mode),
-            "min_daily_reward":    await db.get_setting("min_daily_reward",    s.min_daily_reward),
-            "depth":               await db.get_setting("depth",               s.depth),
-            "category_blacklist":  await db.get_setting("category_blacklist",  s.category_blacklist),
-            "volatility_threshold":await db.get_setting("volatility_threshold",s.volatility_threshold),
-            "min_spread":          await db.get_setting("min_spread",          s.min_spread),
-            "max_ob_spread":       await db.get_setting("max_ob_spread",       s.max_ob_spread),
-            "max_daily_trades":    await db.get_setting("max_daily_trades",    s.max_daily_trades),
-            "max_bid_depth_spread": await db.get_setting("max_bid_depth_spread", s.max_bid_depth_spread),
-            "target_level_share_enabled": await db.get_setting("target_level_share_enabled", s.target_level_share_enabled),
-            "max_target_level_share_pct": await db.get_setting("max_target_level_share_pct", s.max_target_level_share_pct),
-            "target_level_share_confirm_s": await db.get_setting("target_level_share_confirm_s", s.target_level_share_confirm_s),
-            "sell_mode":           await db.get_setting("sell_mode",           s.sell_mode),
-            "market_sell_delay_s": await db.get_setting("market_sell_delay_s", s.market_sell_delay_s),
-            "market_sell_policy":  await db.get_setting("market_sell_policy",  s.market_sell_policy),
-            "market_sell_max_gap_cents": await db.get_setting("market_sell_max_gap_cents", s.market_sell_max_gap_cents),
-            "monitor_interval_s":  await db.get_setting("monitor_interval_s",  s.monitor_interval_s),
-            "front_run_protection": await db.get_setting("front_run_protection", s.front_run_protection),
-            "front_run_bid_threshold_usd": await db.get_setting("front_run_bid_threshold_usd", s.front_run_bid_threshold_usd),
-            "front_run_eat_pct":   await db.get_setting("front_run_eat_pct",   s.front_run_eat_pct),
-            "front_run_window_s":  await db.get_setting("front_run_window_s",  s.front_run_window_s),
-            "front_run_cooldown_s": await db.get_setting("front_run_cooldown_s", s.front_run_cooldown_s),
-            "max_order_usdc":      await db.get_setting("max_order_usdc",      s.max_order_usdc),
-            "max_positions":       await db.get_setting("max_positions",       s.max_positions),
-            "word_blacklist":      await db.get_setting("word_blacklist",      s.word_blacklist),
+        defaults = {
+            "order_usdc":          legacy_order_default,
+            "bot_capital_limit_usdc": s.bot_capital_limit_usdc,
+            "free_balance_buffer_pct": s.free_balance_buffer_pct,
+            "slot_pct":            s.slot_pct,
+            "max_slots_per_market":s.max_slots_per_market,
+            "scan_interval_s":     s.scan_interval_s,
+            "scanner_mode":        s.scanner_mode,
+            "min_daily_reward":    s.min_daily_reward,
+            "depth":               s.depth,
+            "category_blacklist":  s.category_blacklist,
+            "volatility_threshold":s.volatility_threshold,
+            "min_spread":          s.min_spread,
+            "max_ob_spread":       s.max_ob_spread,
+            "max_daily_trades":    s.max_daily_trades,
+            "max_bid_depth_spread": s.max_bid_depth_spread,
+            "target_level_share_enabled": s.target_level_share_enabled,
+            "max_target_level_share_pct": s.max_target_level_share_pct,
+            "target_level_share_confirm_s": s.target_level_share_confirm_s,
+            "sell_mode":           s.sell_mode,
+            "market_sell_delay_s": s.market_sell_delay_s,
+            "market_sell_policy":  s.market_sell_policy,
+            "market_sell_max_gap_cents": s.market_sell_max_gap_cents,
+            "monitor_interval_s":  s.monitor_interval_s,
+            "front_run_protection": s.front_run_protection,
+            "front_run_bid_threshold_usd": s.front_run_bid_threshold_usd,
+            "front_run_eat_pct":   s.front_run_eat_pct,
+            "front_run_window_s":  s.front_run_window_s,
+            "front_run_cooldown_s": s.front_run_cooldown_s,
+            "complement_shadow_enabled": s.complement_shadow_enabled,
+            "complement_shadow_log_interval_s": s.complement_shadow_log_interval_s,
+            "max_order_usdc":      s.max_order_usdc,
+            "max_positions":       s.max_positions,
+            "word_blacklist":      s.word_blacklist,
         }
+        cfg = {key: stored.get(key, default) for key, default in defaults.items()}
+        self._runtime_cfg = cfg
+        self._runtime_cfg_updated_at = time.monotonic()
+        return cfg
 
 
 bot = FarmingBot()
@@ -1866,6 +2404,10 @@ def _short_id(value: str, head: int = 10, tail: int = 6) -> str:
     if not value:
         return "?"
     return value if len(value) <= head + tail + 1 else f"{value[:head]}...{value[-tail:]}"
+
+
+def _fmt_optional(value: float | None) -> str:
+    return "-" if value is None else f"{value:.4f}"
 
 
 def _parse_dt(value: str | None) -> datetime | None:

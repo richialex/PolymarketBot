@@ -109,3 +109,19 @@ def configure_ws_file_logger(name: str = "user_ws", retention_days: int = 14) ->
         logger.addHandler(ws_file)
 
     return logger
+
+
+def configure_shadow_file_logger(
+    name: str = "complement_shadow",
+    retention_days: int = 14,
+) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    if not any(getattr(h, "_polymarket_shadow_file", False) for h in logger.handlers):
+        shadow_file = DailyFileHandler("shadow", retention_days=retention_days)
+        shadow_file._polymarket_shadow_file = True  # type: ignore[attr-defined]
+        logger.addHandler(shadow_file)
+
+    return logger

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -73,6 +74,39 @@ class OrderLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(partial["status"], "PARTIALLY_FILLED")
         self.assertEqual(full["status"], "FILLED")
+
+    async def test_exit_required_transition_preserves_execution_time(self) -> None:
+        await db.upsert_position(buy(size=46))
+        event_at = "2026-07-26T23:40:30.474545+00:00"
+
+        filled = await db.record_cumulative_match(
+            "buy-1",
+            46,
+            source="CANCEL_RECONCILE",
+            event_at=event_at,
+        )
+        await db.update_position_status("buy-1", "EXIT_REQUIRED")
+        stored = await db.get_position("buy-1")
+
+        self.assertEqual(filled["filled_at"], event_at)
+        self.assertEqual(stored["status"], "EXIT_REQUIRED")
+        self.assertEqual(stored["filled_at"], event_at)
+
+    async def test_init_db_repairs_missing_execution_time(self) -> None:
+        position = buy(size=46)
+        position.update(
+            {
+                "matched_size": 46,
+                "status": "EXIT_REQUIRED",
+                "filled_at": None,
+            }
+        )
+        await db.upsert_position(position)
+
+        await db.init_db()
+        stored = await db.get_position("buy-1")
+
+        self.assertEqual(stored["filled_at"], position["placed_at"])
 
     async def test_exit_accounting_uses_sold_and_working_remainders(self) -> None:
         position = buy(size=30)
@@ -231,6 +265,103 @@ class OrderLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["side"], "SELL")
         self.assertFalse(place.await_args.kwargs["post_only"])
         self.assertFalse(place.await_args.kwargs["market_sell"])
+
+    async def test_missing_filled_at_does_not_restart_sell_delay_forever(self) -> None:
+        position = buy(size=46)
+        position.update(
+            {
+                "price": 0.30,
+                "matched_size": 46,
+                "status": "EXIT_REQUIRED",
+                "placed_at": (
+                    datetime.now(timezone.utc) - timedelta(hours=8)
+                ).isoformat(),
+                "filled_at": None,
+            }
+        )
+        await db.upsert_position(position)
+        bot = FarmingBot()
+        book = SimpleNamespace(
+            bids=[SimpleNamespace(price="0.20", size="100")],
+            asks=[SimpleNamespace(price="0.21", size="100")],
+            min_order_size="5",
+        )
+        placed_sell = {
+            **position,
+            "order_id": "sell-maker",
+            "side": "SELL",
+            "status": "OPEN",
+            "parent_order_id": "buy-1",
+        }
+        response = SimpleNamespace(ok=True, order_id="sell-maker", status="LIVE")
+        cfg = {
+            "sell_mode": "market_after_delay",
+            "market_sell_delay_s": 30,
+            "market_sell_policy": "max_gap",
+            "market_sell_max_gap_cents": 4,
+        }
+
+        with (
+            patch.object(bot, "_get_order_book_ws_first", AsyncMock(return_value=book)),
+            patch(
+                "src.bot.client.get_token_position_size_status",
+                AsyncMock(return_value=(46.0, True)),
+            ),
+            patch(
+                "src.bot.order_manager.place_position",
+                AsyncMock(return_value=(response, placed_sell)),
+            ) as place,
+        ):
+            ok = await bot._place_exit_sell_for_buy(
+                position,
+                cfg,
+                {},
+                "recover_sell",
+            )
+
+        self.assertTrue(ok)
+        self.assertTrue(place.await_args.kwargs["post_only"])
+        self.assertFalse(place.await_args.kwargs["market_sell"])
+
+    async def test_external_manual_sale_retires_stale_exit_required(self) -> None:
+        position = buy(size=46)
+        position.update(
+            {
+                "matched_size": 46,
+                "status": "EXIT_REQUIRED",
+                "filled_at": (
+                    datetime.now(timezone.utc) - timedelta(minutes=10)
+                ).isoformat(),
+            }
+        )
+        await db.upsert_position(position)
+        bot = FarmingBot()
+
+        with (
+            patch(
+                "src.bot.client.get_token_position_size_status",
+                AsyncMock(return_value=(0.0, True)),
+            ),
+            patch.object(
+                bot,
+                "_get_order_book_ws_first",
+                AsyncMock(
+                    side_effect=AssertionError(
+                        "no order book is needed after verified external exit"
+                    )
+                ),
+            ),
+        ):
+            ok = await bot._place_exit_sell_for_buy(
+                position,
+                {"sell_mode": "market_after_delay"},
+                {},
+                "recover_sell",
+            )
+
+        stored = await db.get_position("buy-1")
+        self.assertTrue(ok)
+        self.assertEqual(stored["status"], "EXITED")
 
     async def test_partial_dust_uses_market_fak_with_best_bid_floor(self) -> None:
         position = buy(size=73)
